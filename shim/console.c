@@ -61,13 +61,45 @@ static void fmt_hex(char *buf, uint64_t v, int digits)
 	buf[digits] = 0;
 }
 
+/* miami: tee text into the ramoops console zone (0xaf03f800) so Android can read it back */
+#define LOG_BASE	0xaf03f800UL
+#define LOG_CAP		0x3fff4UL
+static uint32_t log_len;
+static void log_sync(void)
+{
+	volatile uint32_t *h = (volatile uint32_t *)LOG_BASE;
+	h[0] = 0x43474244;
+	h[1] = 0;
+	h[2] = log_len;
+}
+static void log_putc(char c)
+{
+	if (log_len < LOG_CAP)
+		((volatile uint8_t *)(LOG_BASE + 12))[log_len++] = (uint8_t)c;
+}
+static void log_str(const char *s)
+{
+	while (*s)
+		log_putc(*s++);
+}
+static void log_nl(void)
+{
+	log_putc('\n');
+	log_sync();
+}
+
 void con_skip(void)
 {
+	log_nl();
 	row++;
 }
 
 void con_str(const char *label, const char *s)
 {
+	log_str(label);
+	log_putc(' ');
+	log_str(s);
+	log_nl();
 	put_str(0, label, YELLOW);
 	put_str(LABEL_COLS, s, WHITE);
 	row++;
@@ -83,6 +115,18 @@ void con_hex(const char *label, uint64_t v)
 void con_hex2(const char *label, const char *a, uint32_t va, const char *b, uint32_t vb)
 {
 	char buf[9];
+	log_str(label);
+	log_putc(' ');
+	log_str(a);
+	fmt_hex(buf, va, 8);
+	log_str(buf);
+	if (b) {
+		log_putc(' ');
+		log_str(b);
+		fmt_hex(buf, vb, 8);
+		log_str(buf);
+	}
+	log_nl();
 	int col = put_str(0, label, YELLOW);
 	col = col < LABEL_COLS ? LABEL_COLS : col + 1;
 	col = put_str(col, a, YELLOW);

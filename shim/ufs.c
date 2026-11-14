@@ -13,7 +13,7 @@
 #include "console.h"
 #include "ufs.h"
 
-#define UFS_BASE	0x01d84000UL	/* ufshc@1d84000, sweet live FDT */
+#define UFS_BASE	0x04804000UL	/* ufshc@1d84000, sweet live FDT */
 
 #define REG_CAP		0x00
 #define REG_VER		0x08
@@ -135,11 +135,13 @@ static uint32_t scsi(uint8_t lun, const uint8_t *cdb, unsigned cdb_len, void *bu
 	return *status_out ? 4 : 0;
 }
 
+static uint8_t cur_lun = 4;	/* miami: userdata lives on LUN 4 (sde) */
+
 static uint32_t read_blocks(uint32_t lba, uint32_t count, void *buf)
 {
 	uint8_t cdb[10] = { 0x28, 0, lba >> 24, lba >> 16, lba >> 8, lba, 0, count >> 8, count, 0 };
 	uint32_t ocs, st;
-	return scsi(0, cdb, sizeof(cdb), buf, count * BLOCK, &ocs, &st);
+	return scsi(cur_lun, cdb, sizeof(cdb), buf, count * BLOCK, &ocs, &st);
 }
 
 static uint64_t le64(const uint8_t *p)
@@ -239,14 +241,18 @@ void test_ufs(void)
 	}
 
 	static const uint8_t cap10[10] = { 0x25 };	/* READ CAPACITY(10) */
-	rc = scsi(0, cap10, sizeof(cap10), data, 8, &ocs, &st);
-	con_hex2("UFS CAP", "rc=", rc, "ocs/st=", ocs << 8 | st);
-	if (!rc)
-		con_hex2("UFS LUN0", "lastlba=", be32(data), "blk=", be32(data + 4));
+	for (uint8_t l = 0; l < 6; l++) {
+		char lab[9] = { 'U', 'F', 'S', ' ', 'L', 'U', 'N', '0' + l, 0 };
+		rc = scsi(l, cap10, sizeof(cap10), data, 8, &ocs, &st);
+		if (!rc)
+			con_hex2(lab, "lastlba=", be32(data), "blk=", be32(data + 4));
+		else
+			con_hex2(lab, "err rc=", rc, "ocs/st=", ocs << 8 | st);
+	}
 
 	/* READ(10) LBA 0, 2 blocks: protective MBR and the GPT header. */
 	static const uint8_t rd10[10] = { 0x28, 0, 0, 0, 0, 0, 0, 0, 2, 0 };
-	rc = scsi(0, rd10, sizeof(rd10), data, 2 * BLOCK, &ocs, &st);
+	rc = scsi(cur_lun, rd10, sizeof(rd10), data, 2 * BLOCK, &ocs, &st);
 	con_hex2("UFS READ", "rc=", rc, "ocs/st=", ocs << 8 | st);
 	if (rc)
 		return;

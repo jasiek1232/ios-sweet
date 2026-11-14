@@ -85,10 +85,24 @@ const char *loader_boot(uintptr_t dtb)
 		return "no initrd in /chosen";
 	con_hex2("INITRD", "lo=", rd_start, "hi=", rd_end);
 
-	const struct payload *p = (const struct payload *)rd_start;
-	if (!magic_ok(p->magic))
+	/*
+	 * miami: Android boot header v3 hands over vendor ramdisk + generic ramdisk
+	 * concatenated, so the payload is not at rd_start. Scan the first 4 MiB
+	 * byte-wise (the MMU is off, so no wider unaligned loads).
+	 */
+	const struct payload *p = 0;
+	uint64_t lim = rd_start + 0x400000 < rd_end ? rd_start + 0x400000 : rd_end;
+	for (uint64_t a = rd_start; a + 8 <= lim; a++)
+		if (*(volatile const uint8_t *)a == 'S' && magic_ok((const char *)a)) {
+			p = (const struct payload *)a;
+			break;
+		}
+	if (!p)
 		return "no SWEETXNU payload";
-	if (p->version != 1 || (p->adt_off & 7) || (rd_start & 7))
+	con_hex2("PAYLOAD", "at=", (uint32_t)(uintptr_t)p, "off=", (uint32_t)((uintptr_t)p - rd_start));
+	if ((uintptr_t)p & 7)
+		return "payload misaligned: pad the ramdisk";
+	if (p->version != 1 || (p->adt_off & 7))
 		return "bad payload header";
 
 	uint64_t pa_of_va_base = p->phys_base - p->virt_base;	/* pa = va + this */
@@ -103,7 +117,7 @@ const char *loader_boot(uintptr_t dtb)
 	for (uint32_t i = 0; i < p->nsegs; i++) {
 		const struct payload_seg *s = &p->segs[i];
 		uintptr_t dst = s->vmaddr + pa_of_va_base;
-		copy64(dst, rd_start + s->file_off, s->file_size);
+		copy64(dst, (uint64_t)(uintptr_t)p + s->file_off, s->file_size);
 		if (s->vmsize > s->file_size)
 			zero64(dst + ((s->file_size + 7) & ~7UL), s->vmsize - ((s->file_size + 7) & ~7UL));
 	}
@@ -111,7 +125,7 @@ const char *loader_boot(uintptr_t dtb)
 
 	/* ADT, then boot_args, behind the kernel; everything below topOfKernelData is ours. */
 	uintptr_t adt_pa = p->kernel_end + pa_of_va_base;
-	copy64(adt_pa, rd_start + p->adt_off, p->adt_size);
+	copy64(adt_pa, (uint64_t)(uintptr_t)p + p->adt_off, p->adt_size);
 	uintptr_t ba_pa = (adt_pa + p->adt_size + PAGE_16K - 1) & ~(PAGE_16K - 1);
 	uintptr_t top = ba_pa + PAGE_16K;
 

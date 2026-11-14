@@ -12,12 +12,12 @@
 #include "loader.h"
 #include "ufs.h"
 
-#define IMEM_RESTART_REASON	0x146aa65cUL	/* qcom,msm-imem restart_reason@65c */
+#define IMEM_RESTART_REASON	0x0c12565cUL	/* qcom,msm-imem restart_reason@65c */
 #define RESTART_BOOTLOADER	0x77665500U
-#define PSHOLD			0x0c264000UL
+#define PSHOLD			0x0440b000UL
 
-#define GICD_BASE		0x17a00000UL
-#define GICR_BASE		0x17a60000UL
+#define GICD_BASE		0x0f200000UL
+#define GICR_BASE		0x0f240000UL
 #define GICR_SIZE		0x100000UL
 #define GICR_PE_SIZE		0x20000UL
 #define GICR_TYPER		0x08
@@ -106,7 +106,7 @@ static void __attribute__((noreturn)) reset(unsigned after_s)
 	con_skip();
 	con_str("RESET", after_s > 20 ? "in 40s" : "in 20s");
 	delay_ms(after_s * 1000);
-	wr32(IMEM_RESTART_REASON, RESTART_BOOTLOADER);
+	/* miami: plain reboot so the persistent log can be read from Android */
 	__asm__ volatile("dsb sy" ::: "memory");
 	smc(PSCI_SYSTEM_RESET, 0, 0, 0);
 	wr32(PSHOLD, 0);
@@ -377,7 +377,7 @@ void shim_main(uint64_t dtb)
 	/* An xnu payload in the ramdisk means: boot it (MMU stays off). */
 	stage = "loader";
 	con_clear(RED);
-	con_str("SHIM", "sweet milestone 4: xnu loader");
+	con_str("SHIM", "miami (SM6375) milestone 4");
 	con_skip();
 	const char *why = loader_boot(dtb);
 	con_str("LOADER", why);
@@ -388,9 +388,9 @@ void shim_main(uint64_t dtb)
 	test_ufs();
 	con_skip();
 	/* Keep the probe results on screen (later tests clear it); reset after 3 min. */
-	con_str("UFS", "probe done, reset in ~3 min");
-	delay_ms(180000);
-	reset(20);
+	con_str("UFS", "probe done, reset in ~45 s");
+	delay_ms(40000);
+	reset(5);
 
 	stage = "fill off";
 	uint64_t fill_off = ticks_fill(RED);
@@ -419,7 +419,7 @@ void shim_main(uint64_t dtb)
 	con_hex("PAR img", mmu_probe((uintptr_t)shim_main));
 	con_hex("PAR fb", mmu_probe(FB_PHYS + 0x1000));
 	con_hex("PAR gic", mmu_probe(GICD_BASE));
-	con_hex("PAR 12G", mmu_probe(0x300000000UL));
+	con_hex("PAR 6G", mmu_probe(0x180000000UL));
 	con_skip();
 	con_hex2("FILL us", "off=", to_us(fill_off), "on=", to_us(fill_on));
 	con_hex2("MEM us", "off=", to_us(mem_off), "on=", to_us(mem_on));
