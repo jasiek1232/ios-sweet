@@ -77,6 +77,19 @@ jobs:
           MAKEFLAGS: ${{ inputs.keep_going == 'false' && '' || '-k' }}
         run: bash build.sh
 
+      - name: Debug IORPC header
+        if: always()
+        run: |
+          echo "=== Patched source header ==="
+          grep -n -B5 -A8 kernelContent dxb/xnu/iokit/DriverKit/IORPC.h || true
+
+          echo "=== All IORPC headers ==="
+          find dxb -name IORPC.h -print
+
+          echo "=== Generated source references ==="
+          grep -Rn kernelContent dxb/build/xnu.obj \
+            --include='*.iig.cpp' | head -30 || true
+
       - name: Package build tree for local compiles
         if: always()
         run: |
