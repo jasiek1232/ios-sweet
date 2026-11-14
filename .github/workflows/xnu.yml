@@ -99,26 +99,6 @@ jobs:
             grep -n -B3 -A5 kernelContent "$f" || echo "NO kernelContent FIELD"
           done
 
-      - name: Diagnose IORPC compiler includes
-        if: always()
-        shell: bash
-        run: |
-          cd dxb
-
-          SRC="build/xnu.obj/DEVELOPMENT_ARM64_SWEET/iokit/DEVELOPMENT/DriverKit/IODataQueueDispatchSource.iig.cpp"
-
-          echo "=== Compiler command from build log ==="
-          grep -n -B5 -A5 'IODataQueueDispatchSource.iig.cpp' ../build.log | head -100 || true
-
-          echo ""
-          echo "=== Header includes in generated source ==="
-          grep -n -E '#include.*IORPC|#include.*DriverKit' "$SRC" | head -50
-
-          echo ""
-          echo "=== Build command files mentioning source ==="
-          find build -type f \( -name '*.json' -o -name '*.txt' -o -name '*.log' \) \
-            -exec grep -l 'IODataQueueDispatchSource.iig.cpp' {} + 2>/dev/null | head -30
-      
       - name: Package build tree for local compiles
         if: always()
         run: |
