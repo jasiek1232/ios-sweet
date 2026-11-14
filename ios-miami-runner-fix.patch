@@ -1,0 +1,48 @@
+diff --git a/.github/workflows/xnu.yml b/.github/workflows/xnu.yml
+index b5addb4..9d48fa9 100644
+--- a/.github/workflows/xnu.yml
++++ b/.github/workflows/xnu.yml
+@@ -34,9 +34,11 @@ env:
+ 
+ jobs:
+   build:
+-    # macos-14 still ships Xcode 15.x: its iig matches the xnu-8796 IORPC ABI
+-    # (Xcode 16's iig emits IORPC.kernelContent, which this xnu lacks)
+-    runs-on: macos-14
++    # macos-14 was retired by GitHub on 2026-11-02 (jobs fail with "configuration
++    # 'macos-14-arm64-us-default' is not supported"). macos-15 only ships Xcode 16.x, whose
++    # iig emits IORPC.kernelContent; xnu/patches/0000-iorpc-kernelcontent-for-xcode16-iig.patch
++    # adds that field to this older xnu. Further Xcode 16 incompatibilities show up as errors.
++    runs-on: macos-15
+     timeout-minutes: 120
+     steps:
+       - uses: actions/checkout@v4
+@@ -61,7 +63,8 @@ jobs:
+           sudo chmod +x /usr/local/bin/xcodes
+           sw_vers
+           ls -d /Applications/Xcode*.app
+-          XC=$(ls -d /Applications/Xcode_*.app | sort -V | head -1)
++          XC=$(ls -d /Applications/Xcode_16*.app 2>/dev/null | sort -V | tail -1)
++          [ -n "$XC" ] || XC=$(ls -d /Applications/Xcode_*.app | sort -V | head -1)
+           echo "DEVELOPER_DIR=$XC/Contents/Developer" >> "$GITHUB_ENV"
+           sudo xcode-select -s "$XC"
+           xcodebuild -version
+diff --git a/xnu/patches/0000-iorpc-kernelcontent-for-xcode16-iig.patch b/xnu/patches/0000-iorpc-kernelcontent-for-xcode16-iig.patch
+new file mode 100644
+index 0000000..c2d044c
+--- /dev/null
++++ b/xnu/patches/0000-iorpc-kernelcontent-for-xcode16-iig.patch
+@@ -0,0 +1,13 @@
++diff --git a/iokit/DriverKit/IORPC.h b/iokit/DriverKit/IORPC.h
++--- a/iokit/DriverKit/IORPC.h
+++++ b/iokit/DriverKit/IORPC.h
++@@ -224,6 +224,9 @@
++ 	IORPCMessageMach * reply;
++ 	uint32_t           sendSize;
++ 	uint32_t           replySize;
+++#ifdef KERNEL
+++	IORPCMessage     * kernelContent;
+++#endif /* KERNEL */
++ };
++ typedef struct IORPC IORPC;
++ 
