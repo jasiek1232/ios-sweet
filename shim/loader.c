@@ -100,8 +100,21 @@ const char *loader_boot(uintptr_t dtb)
 	if (!p)
 		return "no SWEETXNU payload";
 	con_hex2("PAYLOAD", "at=", (uint32_t)(uintptr_t)p, "off=", (uint32_t)((uintptr_t)p - rd_start));
-	if ((uintptr_t)p & 7)
-		return "payload misaligned: pad the ramdisk";
+	if ((uintptr_t)p & 7) {
+		/*
+		 * The bootloader's vendor ramdisk was not the size mkshimboot.py assumed,
+		 * so the payload starts unaligned (MMU off: unaligned loads fault). Slide it
+		 * down to the previous 8-byte boundary, byte by byte, forward copy (dst < src).
+		 */
+		uintptr_t k = (uintptr_t)p & 7;
+		volatile uint8_t *d = (volatile uint8_t *)((uintptr_t)p - k);
+		volatile const uint8_t *sp = (volatile const uint8_t *)p;
+		con_hex2("REALIGN", "shift=", k, "bytes=", rd_end - (uint64_t)(uintptr_t)p);
+		for (uint64_t i = 0; (uint64_t)(uintptr_t)(sp + i) < rd_end; i++)
+			d[i] = sp[i];
+		__asm__ volatile ("dsb sy" ::: "memory");
+		p = (const struct payload *)(uintptr_t)d;
+	}
 	if (p->version != 1 || (p->adt_off & 7))
 		return "bad payload header";
 
