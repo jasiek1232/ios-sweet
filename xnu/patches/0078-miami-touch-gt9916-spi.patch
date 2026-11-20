@@ -1,0 +1,633 @@
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -108,6 +108,7 @@
+ bsd/dev/sweet_sample.c			standard
+ bsd/dev/sweet_keys.c			standard
+ bsd/dev/sweet_touch.c			standard
++bsd/dev/sweet_touch_gt9916.c		standard
+ bsd/dev/sweet_rpmh.c			standard
+ bsd/dev/sweet_spmi.c			standard
+ bsd/dev/sweet_usb.c			standard
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -20,6 +20,8 @@
+ extern kern_return_t thread_terminate(thread_t);
+ extern int sweet_rpmh_vreg_enable(const char *res, unsigned mv);
+ extern void sweet_hid_touch(int finger, int down, int x, int y);
++/* miami: Goodix GT9916S over GENI SPI, in sweet_touch_gt9916.c (sweettouch=2). */
++extern void sweet_touch_gt9916_start(void);
+ void sweet_touch_init(void);
+ 
+ #define TOUCH_SE_PA      0x00a84000u
+@@ -650,6 +652,10 @@
+ 		printf("SWEET TOUCH: disabled (sweettouch=0)\n");
+ 		return;
+ 	}
++	if (enabled == 2) {
++		sweet_touch_gt9916_start();
++		return;
++	}
+ 	kern_return_t kr = kernel_thread_start(touch_thread, NULL, &thread);
+ 	if (kr == KERN_SUCCESS) {
+ 		thread_deallocate(thread);
+--- /dev/null
++++ b/bsd/dev/sweet_touch_gt9916.c
+@@ -0,0 +1,598 @@
++/*
++ * miami (Motorola Edge 30 Neo, SM6375): Goodix GT9916S touch over the GENI SPI engine.
++ *
++ * Port of ios-sweet's shim/touch.c, which was verified on the phone (it printed live
++ * touch coordinates). Enable with boot-arg sweettouch=2; sweettouch=1 keeps the
++ * Xiaomi GT9896/I2C driver in sweet_touch.c. All work runs on one kernel thread.
++ *
++ * Hardware (live FDT): spi@4a80000 = QUPv3 wrapper 0 serial engine 0, CS0, mode 0.
++ * SPI pins gpio0..3 (function qup00), reset gpio21, irq gpio22 (polled, not used),
++ * iovdd gpio135, avdd gpio136. Protocol: Linux goodix_berlin_{core,spi}.c (BerlinD).
++ * No firmware/config upload. The only IC writes are the 0xAA chip-confirm pattern at
++ * 0x10000 and a zero acknowledging each touch frame, as Linux does.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern kern_return_t thread_terminate(thread_t);
++extern void sweet_hid_touch(int finger, int down, int x, int y);
++void sweet_touch_gt9916_start(void);
++
++#define G_GCC_PA        0x01400000u
++#define G_GCC_SIZE      0x001f0000u
++#define G_TLMM_PA       0x00500000u     /* per-pin registers: 0x500000 + 0x1000 * gpio */
++#define G_TLMM_SIZE     0x00090000u
++#define G_SE_PA         0x04a80000u
++#define G_SE_SIZE       0x00004000u
++
++/* GCC: QUP wrapper 0 clocks */
++#define G_VOTE          0x7900cu        /* bit6 M_AHB, bit7 S_AHB, bit10 S0 */
++#define G_M_AHB_HALT    0x1f004u
++#define G_S_AHB_HALT    0x1f008u
++#define G_S0_HALT       0x1f144u
++#define G_S0_RCG        0x1f148u
++
++/* GENI serial engine */
++#define SE_FORCE_DEFAULT 0x20u
++#define SE_OUTPUT_CTRL  0x24u
++#define SE_CGC_CTRL     0x28u
++#define SE_STATUS       0x40u
++#define SE_M_CLK_CFG    0x48u
++#define SE_IF_DISABLE   0x64u
++#define SE_FW_REV       0x68u
++#define SE_CLK_SEL      0x7cu
++#define SE_SPI_CPHA     0x224u
++#define SE_SPI_LOOPBACK 0x22cu
++#define SE_SPI_CPOL     0x230u
++#define SE_SPI_DEMUXINV 0x24cu
++#define SE_SPI_DEMUXSEL 0x250u
++#define SE_BYTE_GRAN    0x254u
++#define SE_DMA_MODE_EN  0x258u
++#define SE_SPI_TRANSCFG 0x25cu
++#define SE_TX_PACK0     0x260u
++#define SE_TX_PACK1     0x264u
++#define SE_SPI_WORDLEN  0x268u
++#define SE_SPI_TXLEN    0x26cu
++#define SE_SPI_RXLEN    0x270u
++#define SE_SPI_PREPOST  0x274u
++#define SE_SPI_DELAYCNT 0x278u
++#define SE_RX_PACK0     0x284u
++#define SE_RX_PACK1     0x288u
++#define SE_SPI_SLAVEEN  0x2bcu
++#define SE_M_CMD0       0x600u
++#define SE_M_CMD_CTRL   0x604u
++#define SE_M_IRQ_STATUS 0x610u
++#define SE_M_IRQ_EN     0x614u
++#define SE_M_IRQ_CLEAR  0x618u
++#define SE_TX_FIFO      0x700u
++#define SE_RX_FIFO      0x780u
++#define SE_TX_FIFO_ST   0x800u
++#define SE_RX_FIFO_ST   0x804u
++#define SE_RX_WM        0x810u
++#define SE_RX_RFR_WM    0x814u
++#define SE_GSI_EVENT_EN 0xe18u
++#define SE_IRQ_EN       0xe1cu
++#define SE_HW_PARAM_0   0xe24u
++#define SE_DMA_GENCFG   0xe30u
++
++#define M_CMD_DONE      (1u << 0)
++#define M_RX_WM         (1u << 26)
++#define M_RX_LAST       (1u << 27)
++#define M_TX_WM         (1u << 30)
++#define SPI_TX_ONLY     1u
++#define SPI_FULL_DUPLEX 3u
++
++#define G_GPIO_RESET    21u
++#define G_GPIO_IRQ      22u
++#define G_GPIO_IOVDD    135u
++#define G_GPIO_AVDD     136u
++
++#define G_MAX_TOUCH     10u
++#define G_TXRX_MAX      1100u
++
++static struct {
++	vm_offset_t gcc, tlmm, se;
++	unsigned fifo_depth;
++	uint32_t touch_addr;
++	uint32_t active;
++	int x[G_MAX_TOUCH], y[G_MAX_TOUCH];
++	bool started;
++} g;
++static int g_sleep_chan;
++static uint8_t g_tx[G_TXRX_MAX], g_rx[G_TXRX_MAX];
++
++static uint32_t
++g_rd(vm_offset_t base, uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(base + off);
++	__asm__ volatile ("dmb oshld" ::: "memory");
++	return v;
++}
++
++static void
++g_wr(vm_offset_t base, uint32_t off, uint32_t val)
++{
++	__asm__ volatile ("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(base + off) = val;
++	__asm__ volatile ("dsb osh" ::: "memory");
++}
++
++static void
++g_wait(unsigned ms)
++{
++	uint64_t deadline;
++	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
++	(void)assert_wait_deadline(&g_sleep_chan, THREAD_UNINT, deadline);
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++/* ---- TLMM ---- */
++static void
++g_gpio_cfg(unsigned n, unsigned func, unsigned pull, unsigned drive_ma, bool oe)
++{
++	uint32_t cur = g_rd(g.tlmm, n * 0x1000u);
++	uint32_t v = (pull & 3u) | ((func & 0xfu) << 2) | ((((drive_ma / 2u) - 1u) & 7u) << 6) |
++	    (oe ? (1u << 9) : 0u);
++	if (cur & (1u << 11)) {         /* eGPIO capable: claim it for the application processor */
++		v |= 1u << 12;
++	}
++	g_wr(g.tlmm, n * 0x1000u, v);
++}
++
++static void
++g_gpio_out(unsigned n, unsigned v)
++{
++	g_wr(g.tlmm, n * 0x1000u + 4u, v ? 2u : 0u);
++}
++
++static unsigned
++g_gpio_in(unsigned n)
++{
++	return g_rd(g.tlmm, n * 0x1000u + 4u) & 1u;
++}
++
++/* ---- clocks ---- */
++static bool
++g_clocks_on(void)
++{
++	g_wr(g.gcc, G_VOTE, g_rd(g.gcc, G_VOTE) | (1u << 6) | (1u << 7) | (1u << 10));
++	g_wait(2);
++	if (!(g_rd(g.gcc, G_S0_RCG + 0x14u) & 1u)) {
++		/* not in DFS mode: XO, divider 1 */
++		g_wr(g.gcc, G_S0_RCG + 4u, 1u);
++		g_wr(g.gcc, G_S0_RCG, g_rd(g.gcc, G_S0_RCG) | 1u);
++		for (unsigned i = 0; i < 1000 && (g_rd(g.gcc, G_S0_RCG) & 1u); i++) {
++			delay(10);
++		}
++		g_wr(g.gcc, G_S0_RCG, g_rd(g.gcc, G_S0_RCG) | 2u);
++		g_wait(1);
++	}
++	uint32_t off = g_rd(g.gcc, G_M_AHB_HALT) | g_rd(g.gcc, G_S_AHB_HALT) | g_rd(g.gcc, G_S0_HALT);
++	printf("SWEET TOUCH9916: QUP0 clocks mahb=%#x sahb=%#x s0=%#x\n",
++	    g_rd(g.gcc, G_M_AHB_HALT), g_rd(g.gcc, G_S_AHB_HALT), g_rd(g.gcc, G_S0_HALT));
++	return !(off & (1u << 31));
++}
++
++/* ---- GENI SPI engine ---- */
++static void
++g_config_packing(uint32_t bpw, uint32_t pack_words)
++{
++	uint32_t cfg[4] = {0, 0, 0, 0};
++	int idx_start = (int)bpw - 1, idx = idx_start, temp = (int)bpw;
++	int iter = (int)((((bpw + 7u) & ~7u) * pack_words) / 8u);
++
++	for (int i = 0; i < iter && i < 4; i++) {
++		int len = (temp < 8 ? temp : 8) - 1;
++		cfg[i] = ((uint32_t)idx << 5) | (1u << 4) | ((uint32_t)len << 1);
++		if (temp <= 8) {
++			idx = (i + 1) * 8 + idx_start;
++			temp = (int)bpw;
++		} else {
++			idx -= 8;
++			temp -= 8;
++		}
++	}
++	cfg[iter - 1] |= 1u;
++	uint32_t c0 = cfg[0] | (cfg[1] << 10), c1 = cfg[2] | (cfg[3] << 10);
++	g_wr(g.se, SE_TX_PACK0, c0);
++	g_wr(g.se, SE_TX_PACK1, c1);
++	g_wr(g.se, SE_RX_PACK0, c0);
++	g_wr(g.se, SE_RX_PACK1, c1);
++	g_wr(g.se, SE_BYTE_GRAN, bpw / 16u);
++}
++
++static void
++g_spi_set(unsigned mode, unsigned div)
++{
++	g_wr(g.se, SE_SPI_CPHA, mode & 1u);
++	g_wr(g.se, SE_SPI_CPOL, (mode >> 1) & 1u);
++	g_wr(g.se, SE_M_CLK_CFG, (div << 4) | 1u);
++}
++
++static bool
++g_spi_init(void)
++{
++	uint32_t fw = g_rd(g.se, SE_FW_REV);
++	uint32_t ifd = g_rd(g.se, SE_IF_DISABLE);
++	uint32_t hp0 = g_rd(g.se, SE_HW_PARAM_0);
++
++	printf("SWEET TOUCH9916: SE0 fw=%#x ifdis=%#x hw0=%#x status=%#x\n", fw, ifd, hp0,
++	    g_rd(g.se, SE_STATUS));
++	if (((fw >> 8) & 0xffu) != 1u) {
++		printf("SWEET TOUCH9916: SE0 protocol is not SPI\n");
++		return false;
++	}
++	if (ifd & 1u) {
++		printf("SWEET TOUCH9916: SE0 FIFO interface disabled\n");
++		return false;
++	}
++	g.fifo_depth = (hp0 >> 16) & 0x3fu;
++	if (!g.fifo_depth) {
++		g.fifo_depth = 16;
++	}
++	g_wr(g.se, SE_CGC_CTRL, g_rd(g.se, SE_CGC_CTRL) | 0x7fu);
++	g_wr(g.se, SE_DMA_GENCFG, g_rd(g.se, SE_DMA_GENCFG) | 0xfu);
++	g_wr(g.se, SE_OUTPUT_CTRL, 0x7fu);
++	g_wr(g.se, SE_FORCE_DEFAULT, 1u);
++	g_wr(g.se, SE_IRQ_EN, g_rd(g.se, SE_IRQ_EN) | 0xfu);
++	g_wr(g.se, SE_DMA_MODE_EN, g_rd(g.se, SE_DMA_MODE_EN) & ~1u);
++	g_wr(g.se, SE_GSI_EVENT_EN, 0);
++	g_wr(g.se, SE_RX_WM, g.fifo_depth - 3u);
++	g_wr(g.se, SE_RX_RFR_WM, g.fifo_depth - 2u);
++	g_wr(g.se, SE_M_IRQ_EN, g_rd(g.se, SE_M_IRQ_EN) | 0x7eu | (1u << 22) | (1u << 23) |
++	    (0xfu << 24) | M_CMD_DONE | M_RX_WM | M_RX_LAST | M_TX_WM);
++	g_wr(g.se, SE_M_IRQ_CLEAR, 0xffffffffu);
++	g_wr(g.se, SE_SPI_SLAVEEN, 0);
++	g_wr(g.se, SE_SPI_LOOPBACK, 0);
++	g_wr(g.se, SE_SPI_DEMUXSEL, 0);
++	g_wr(g.se, SE_SPI_DEMUXINV, 0);
++	g_wr(g.se, SE_SPI_TRANSCFG, 0);
++	g_wr(g.se, SE_SPI_PREPOST, 0);
++	g_wr(g.se, SE_SPI_DELAYCNT, 0);
++	g_config_packing(8, 4);
++	g_wr(g.se, SE_SPI_WORDLEN, 8u - 4u);
++	g_wr(g.se, SE_CLK_SEL, 0);
++	g_spi_set(0, 4);                /* mode 0, 19.2 MHz / 4 = 4.8 MHz */
++	return true;
++}
++
++static unsigned
++g_drain_rx(unsigned rx_got, unsigned len)
++{
++	for (;;) {
++		uint32_t rs = g_rd(g.se, SE_RX_FIFO_ST);
++		unsigned wc = rs & 0x01ffffffu;
++		if (!wc) {
++			break;
++		}
++		for (unsigned k = 0; k < wc; k++) {
++			uint32_t w = g_rd(g.se, SE_RX_FIFO);
++			unsigned nb = 4;
++			if (k == wc - 1 && (rs & (1u << 31))) {
++				nb = (rs >> 28) & 7u;
++				if (!nb) {
++					nb = 4;
++				}
++			}
++			for (unsigned b = 0; b < nb && rx_got < len; b++) {
++				g_rx[rx_got++] = (uint8_t)((w >> (8 * b)) & 0xffu);
++			}
++		}
++	}
++	return rx_got;
++}
++
++/* One chip-select assertion: len bytes out of g_tx and, if rx, len bytes into g_rx. */
++static int
++g_spi_xfer(unsigned len, bool rx)
++{
++	unsigned tx_words = (len + 3u) / 4u, tx_done = 0, rx_got = 0;
++	unsigned spins = 0;
++
++	g_wr(g.se, SE_M_IRQ_CLEAR, 0xffffffffu);
++	g_wr(g.se, SE_SPI_TXLEN, len);
++	if (rx) {
++		g_wr(g.se, SE_SPI_RXLEN, len);
++	}
++	g_wr(g.se, SE_M_CMD0, (rx ? SPI_FULL_DUPLEX : SPI_TX_ONLY) << 27);
++
++	for (;;) {
++		uint32_t st = g_rd(g.se, SE_M_IRQ_STATUS);
++
++		while (tx_done < tx_words) {
++			uint32_t wc = g_rd(g.se, SE_TX_FIFO_ST) & 0x0fffffffu;
++			if (wc >= g.fifo_depth) {
++				break;
++			}
++			uint32_t w = 0;
++			for (unsigned b = 0; b < 4; b++) {
++				unsigned i = tx_done * 4u + b;
++				if (i < len) {
++					w |= (uint32_t)g_tx[i] << (8 * b);
++				}
++			}
++			g_wr(g.se, SE_TX_FIFO, w);
++			tx_done++;
++		}
++		if (rx) {
++			rx_got = g_drain_rx(rx_got, len);
++		}
++		if (st & M_CMD_DONE) {
++			g_wr(g.se, SE_M_IRQ_CLEAR, st);
++			if (rx) {
++				rx_got = g_drain_rx(rx_got, len);
++			}
++			return (rx && rx_got < len) ? EIO : 0;
++		}
++		if (++spins > 60000u) {         /* ~60 ms of 1 us steps */
++			g_wr(g.se, SE_M_CMD_CTRL, 2u);  /* abort */
++			delay(1000);
++			g_wr(g.se, SE_M_IRQ_CLEAR, 0xffffffffu);
++			return ETIMEDOUT;
++		}
++		delay(1);
++	}
++}
++
++/* ---- Goodix Berlin-D over SPI ---- */
++static int
++g_read(uint32_t addr, uint8_t *dst, unsigned n)
++{
++	unsigned len = 8u + n;
++	if (len > G_TXRX_MAX) {
++		return EINVAL;
++	}
++	for (unsigned i = 0; i < len; i++) {
++		g_tx[i] = 0;
++	}
++	g_tx[0] = 0xf1u;
++	g_tx[1] = (uint8_t)(addr >> 24);
++	g_tx[2] = (uint8_t)(addr >> 16);
++	g_tx[3] = (uint8_t)(addr >> 8);
++	g_tx[4] = (uint8_t)addr;
++	int r = g_spi_xfer(len, true);
++	if (r) {
++		return r;
++	}
++	for (unsigned i = 0; i < n; i++) {
++		dst[i] = g_rx[8u + i];
++	}
++	return 0;
++}
++
++static int
++g_write(uint32_t addr, const uint8_t *src, unsigned n)
++{
++	if (5u + n > G_TXRX_MAX) {
++		return EINVAL;
++	}
++	g_tx[0] = 0xf0u;
++	g_tx[1] = (uint8_t)(addr >> 24);
++	g_tx[2] = (uint8_t)(addr >> 16);
++	g_tx[3] = (uint8_t)(addr >> 8);
++	g_tx[4] = (uint8_t)addr;
++	for (unsigned i = 0; i < n; i++) {
++		g_tx[5u + i] = src[i];
++	}
++	return g_spi_xfer(5u + n, false);
++}
++
++static uint32_t
++g_le32(const uint8_t *p)
++{
++	return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
++}
++
++static unsigned
++g_le16(const uint8_t *p)
++{
++	return (unsigned)p[0] | ((unsigned)p[1] << 8);
++}
++
++static void
++g_report(uint32_t mask, const int *x, const int *y)
++{
++	for (unsigned id = 0; id < G_MAX_TOUCH; ++id) {
++		uint32_t bit = 1u << id;
++		if (mask & bit) {
++			if (!(g.active & bit) || x[id] != g.x[id] || y[id] != g.y[id]) {
++				sweet_hid_touch((int)id, 1, x[id], y[id]);
++			}
++			g.x[id] = x[id];
++			g.y[id] = y[id];
++		} else if (g.active & bit) {
++			sweet_hid_touch((int)id, 0, g.x[id], g.y[id]);
++		}
++	}
++	g.active = mask;
++}
++
++static int
++g_poll_touch(void)
++{
++	static uint8_t ev[8u + G_MAX_TOUCH * 8u + 2u];
++	static const uint8_t zero = 0;
++	int err = g_read(g.touch_addr, ev, 8u + 2u * 8u + 2u);
++	if (err) {
++		return err;
++	}
++	if (!(ev[0] & 0x80u)) {
++		if (ev[0] & 0x40u) {
++			static bool warned;
++			if (!warned) {
++				warned = true;
++				printf("SWEET TOUCH9916: chip request event %#x ignored\n", ev[0]);
++			}
++		}
++		return 0;
++	}
++	unsigned n = ev[2] & 0xfu;
++	if (n > G_MAX_TOUCH) {
++		(void)g_write(g.touch_addr, &zero, 1);
++		return EIO;
++	}
++	if (n > 2) {
++		err = g_read(g.touch_addr, ev, 8u + n * 8u + 2u);
++		if (err) {
++			return err;
++		}
++	}
++	int x[G_MAX_TOUCH] = {0}, y[G_MAX_TOUCH] = {0};
++	uint32_t mask = 0;
++	for (unsigned i = 0; i < n; i++) {
++		const uint8_t *p = ev + 8u + i * 8u;
++		unsigned id = p[0] >> 4;
++		if (id >= G_MAX_TOUCH || (mask & (1u << id))) {
++			continue;
++		}
++		/* The panel reports on an 8640 x 19200 grid; the HID layer wants 1080 x 2400. */
++		unsigned px = g_le16(p + 2) / 8u, py = g_le16(p + 4) / 8u;
++		if (px > 1079u) {
++			px = 1079u;
++		}
++		if (py > 2399u) {
++			py = 2399u;
++		}
++		mask |= 1u << id;
++		x[id] = (int)px;
++		y[id] = (int)py;
++	}
++	err = g_write(g.touch_addr, &zero, 1);  /* acknowledge the frame */
++	g_report(mask, x, y);
++	return err;
++}
++
++static bool
++g_chip_up(void)
++{
++	static uint8_t b[1100];
++	static const uint8_t aa[8] = {0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa};
++
++	/* supplies and reset, as in Linux goodix_berlin_power_on */
++	g_gpio_cfg(G_GPIO_RESET, 0, 3, 8, true);
++	g_gpio_out(G_GPIO_RESET, 0);
++	g_gpio_cfg(G_GPIO_IRQ, 0, 3, 8, false);
++	g_gpio_cfg(G_GPIO_IOVDD, 0, 0, 2, true);
++	g_gpio_cfg(G_GPIO_AVDD, 0, 0, 2, true);
++	g_gpio_out(G_GPIO_IOVDD, 1);
++	g_wait(3);
++	g_gpio_out(G_GPIO_AVDD, 1);
++	g_wait(15);
++	g_gpio_out(G_GPIO_RESET, 1);
++	g_wait(250);
++	printf("SWEET TOUCH9916: iovdd=%u avdd=%u rst=%u irq=%u\n", g_gpio_in(G_GPIO_IOVDD),
++	    g_gpio_in(G_GPIO_AVDD), g_gpio_in(G_GPIO_RESET), g_gpio_in(G_GPIO_IRQ));
++
++	/* find an SPI mode/clock the chip answers in (mode 0 at 4.8 MHz did on the test phone) */
++	static const unsigned divs[2] = {4, 16};
++	bool ok = false;
++	for (unsigned m = 0; m < 4 && !ok; m++) {
++		for (unsigned di = 0; di < 2 && !ok; di++) {
++			g_spi_set(m, divs[di]);
++			int w = g_write(0x10000, aa, 8);
++			g_wait(1);
++			int r = g_read(0x10000, b, 8);
++			if (!w && !r && b[0] == 0xaa && b[7] == 0xaa) {
++				ok = true;
++				printf("SWEET TOUCH9916: chip answers in mode %u div %u\n", m, divs[di]);
++			}
++		}
++	}
++	if (!ok) {
++		printf("SWEET TOUCH9916: chip does not answer\n");
++		return false;
++	}
++	g_wait(100);
++
++	if (g_read(0x10070, b, 2)) {
++		return false;
++	}
++	unsigned length = g_le16(b);
++	if (length < 64u || length >= 1024u) {
++		printf("SWEET TOUCH9916: bad IC info length %u\n", length);
++		return false;
++	}
++	if (g_read(0x10070, b, length)) {
++		return false;
++	}
++	unsigned off = 2u + 16u + 10u + 4u;     /* length, version, feature, drv/sen/btn/force */
++	for (unsigned k = 0; k < 5u && off < length; k++) {
++		off += 1u + 2u * b[off];
++	}
++	if (off + 48u <= length) {
++		g.touch_addr = g_le32(&b[off + 44u]);
++	}
++	printf("SWEET TOUCH9916: touch data address %#x\n", g.touch_addr);
++	return g.touch_addr != 0;
++}
++
++static void
++g_thread(void *arg, wait_result_t result)
++{
++	unsigned delay_s = 20;
++	(void)arg;
++	(void)result;
++	/* Start late: if anything below hangs the bus, the GUI and log got there first. */
++	(void)PE_parse_boot_argn("sweettouchdelay", &delay_s, sizeof(delay_s));
++	printf("SWEET TOUCH9916: starting in %u s\n", delay_s);
++	g_wait(delay_s * 1000u);
++	g.gcc = ml_io_map(G_GCC_PA, G_GCC_SIZE);
++	g.tlmm = ml_io_map(G_TLMM_PA, G_TLMM_SIZE);
++	g.se = ml_io_map(G_SE_PA, G_SE_SIZE);
++	if (!g.gcc || !g.tlmm || !g.se) {
++		printf("SWEET TOUCH9916: MMIO mapping failed\n");
++		goto out;
++	}
++	if (!g_clocks_on()) {
++		printf("SWEET TOUCH9916: a QUP clock stayed off\n");
++		goto out;
++	}
++	/* SPI pins: gpio0/1 use function 2, gpio2/3 function 1 (qup00) */
++	g_gpio_cfg(0, 2, 0, 8, false);
++	g_gpio_cfg(1, 2, 0, 8, false);
++	g_gpio_cfg(2, 1, 0, 8, false);
++	g_gpio_cfg(3, 1, 0, 8, false);
++	if (!g_spi_init() || !g_chip_up()) {
++		goto out;
++	}
++	printf("SWEET TOUCH9916: running\n");
++	unsigned errs = 0, frames = 0;
++	for (;;) {
++		g_wait(4);
++		int e = g_poll_touch();
++		if (e) {
++			if (++errs <= 5u || (errs % 1000u) == 0u) {
++				printf("SWEET TOUCH9916: read error %d (count %u)\n", e, errs);
++			}
++		} else if (++frames == 1u) {
++			printf("SWEET TOUCH9916: first frame\n");
++		}
++	}
++out:
++	(void)thread_terminate(current_thread());
++}
++
++void
++sweet_touch_gt9916_start(void)
++{
++	thread_t thread;
++	if (g.started) {
++		return;
++	}
++	g.started = true;
++	kern_return_t kr = kernel_thread_start(g_thread, NULL, &thread);
++	if (kr == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	} else {
++		printf("SWEET TOUCH9916: kernel_thread_start failed %d\n", kr);
++	}
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
