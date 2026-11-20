@@ -32,7 +32,7 @@
  		thread_deallocate(thread);
 --- /dev/null
 +++ b/bsd/dev/sweet_touch_gt9916.c
-@@ -0,0 +1,688 @@
+@@ -0,0 +1,750 @@
 +/*
 + * miami (Motorola Edge 30 Neo, SM6375): Goodix GT9916S touch over the GENI SPI engine.
 + *
@@ -696,6 +696,67 @@
 +}
 +
 +static void
++g_dump_range(vm_offset_t va, uint32_t from, uint32_t to)
++{
++	for (uint32_t o = from; o < to; o += 16) {
++		printf("SWEET CPUF[%03x] %08x %08x %08x %08x\n", o,
++		    *(volatile uint32_t *)(va + o), *(volatile uint32_t *)(va + o + 4),
++		    *(volatile uint32_t *)(va + o + 8), *(volatile uint32_t *)(va + o + 12));
++	}
++}
++
++/* Rough CPU speed: iterations/us of a 1-cycle-per-iteration loop timed with the 19.2 MHz counter. */
++static unsigned
++g_loop_mhz(uint64_t *mpidr_out)
++{
++	uint64_t t0, t1, i = 20000000ULL, best = 0;
++	for (int k = 0; k < 5; k++) {
++		i = 20000000ULL;
++		__asm__ volatile ("isb\n mrs %0, cntvct_el0" : "=r"(t0) :: "memory");
++		__asm__ volatile ("1: subs %0, %0, #1\n b.ne 1b" : "+r"(i) :: "cc");
++		__asm__ volatile ("isb\n mrs %0, cntvct_el0" : "=r"(t1) :: "memory");
++		uint64_t us = ((t1 - t0) * 1000000ULL) / 19200000ULL;
++		uint64_t mhz = us ? (20000000ULL / us) : 0;
++		if (mhz > best) {
++			best = mhz;
++		}
++	}
++	__asm__ volatile ("mrs %0, mpidr_el1" : "=r"(*mpidr_out));
++	return (unsigned)best;
++}
++
++static void
++g_cpufreq_thread(void *arg, wait_result_t w)
++{
++	(void)arg;
++	(void)w;
++	g_wait(25000);
++	for (int d = 0; d < 2; d++) {
++		uint64_t pa = d ? 0x0fd92000ULL : 0x0fd91000ULL;
++		printf("SWEET CPUF: domain %d PA 0x%llx ...\n", d, (unsigned long long)pa);
++		vm_offset_t va = ml_io_map((vm_offset_t)pa, 0x1000);
++		if (!va) {
++			printf("SWEET CPUF: map failed\n");
++			continue;
++		}
++		g_dump_range(va, 0x000, 0x020);
++		g_dump_range(va, 0x100, 0x140);   /* freq LUT */
++		g_dump_range(va, 0x200, 0x240);   /* volt LUT */
++		g_dump_range(va, 0x300, 0x340);   /* perf state / vote */
++		g_dump_range(va, 0x3c0, 0x3d0);   /* cycle counter */
++	}
++	for (int k = 0; k < 8; k++) {
++		uint64_t mp = 0;
++		unsigned mhz = g_loop_mhz(&mp);
++		printf("SWEET CPUF: speed test %d: core mpidr 0x%llx ~%u M loops/s\n", k,
++		    (unsigned long long)(mp & 0xff00), mhz);
++		g_wait(400);
++	}
++	printf("SWEET CPUF: done\n");
++	(void)thread_terminate(current_thread());
++}
++
++static void
 +g_spawn(thread_continue_t fn, void *arg)
 +{
 +	thread_t thread;
@@ -719,5 +780,6 @@
 +	g_spawn(g_usbp_thread, (void *)(uintptr_t)0x0162b000ULL);
 +	g_spawn(g_usbp_thread, (void *)(uintptr_t)0x01630000ULL);
 +	g_spawn(g_usbmain_thread, NULL);
++	g_spawn(g_cpufreq_thread, NULL);
 +}
 +#endif /* ARM64_BOARD_CONFIG_SWEET */
