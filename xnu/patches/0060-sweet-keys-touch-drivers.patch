@@ -35,7 +35,7 @@
 @@ -0,0 +1,182 @@
 +/*
 + * Minimal polled SWEET keys. Call once after the scheduler is running.
-+ * See hw-report.md: miami (SM6375): power+resin = PM6125 SID 0 PON (PPID 0x008), volume-up = PM6125 SID 1 GPIO1 (PPID 0x1c0, pid 0xc0).
++ * See hw-report.md: miami (SM6375): power+resin = PM6125 SID 0 PON (PPID 0x008), volume-up = PMR735A SID 4 GPIO1 (PPID 0x488, base 0x8800).
 + * PMIC access is READ ONLY: the sole MMIO write issues EXT_READL on an
 + * observer channel. No PMIC config, IRQ acknowledge or reset writes exist.
 + */
@@ -56,7 +56,7 @@
 +#define KEYS_OBS_PA      0x03e00000u
 +#define KEYS_CNFG_PA     0x01c0a000u
 +#define KEYS_PON_RT      0x0810u
-+#define KEYS_GPIO_RT     0xc010u
++#define KEYS_GPIO_RT     0x8810u
 +#define KEYS_NO_APID     0xffffu
 +
 +static vm_offset_t keys_core, keys_obs, keys_cnfg;
@@ -187,13 +187,13 @@
 +		return;
 +	}
 +	keys_pon_apid = keys_find_apid(0x008, count);
-+	keys_gpio_apid = keys_find_apid(0x1c0, count);
++	keys_gpio_apid = keys_find_apid(0x488, count);
 +	uint8_t pon = 0, gpio = 0, mode = 0, en = 0, subtype = 0;
 +	bool pok = keys_read(keys_pon_apid, KEYS_PON_RT, &pon);
 +	bool gok = keys_read(keys_gpio_apid, KEYS_GPIO_RT, &gpio);
-+	bool mok = keys_read(keys_gpio_apid, 0xc040, &mode);
-+	bool eok = keys_read(keys_gpio_apid, 0xc046, &en);
-+	bool sok = keys_read(keys_gpio_apid, 0xc005, &subtype);
++	bool mok = keys_read(keys_gpio_apid, 0x8840, &mode);
++	bool eok = keys_read(keys_gpio_apid, 0x8846, &en);
++	bool sok = keys_read(keys_gpio_apid, 0x8805, &subtype);
 +	printf("SWEET KEYS: arb=%#x apids=%u pon-apid=%u gpio4-apid=%u pon=%#x/%d gpio=%#x/%d mode=%#x/%d en=%#x/%d subtype=%#x/%d\n",
 +	    keys_version, count, keys_pon_apid, keys_gpio_apid,
 +	    pon, pok, gpio, gok, mode, mok, en, eok, subtype, sok);
