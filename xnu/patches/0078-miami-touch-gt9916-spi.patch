@@ -32,7 +32,7 @@
  		thread_deallocate(thread);
 --- /dev/null
 +++ b/bsd/dev/sweet_touch_gt9916.c
-@@ -0,0 +1,750 @@
+@@ -0,0 +1,788 @@
 +/*
 + * miami (Motorola Edge 30 Neo, SM6375): Goodix GT9916S touch over the GENI SPI engine.
 + *
@@ -55,6 +55,7 @@
 +#include <kern/sched_prim.h>
 +#include <machine/machine_routines.h>
 +#include <pexpert/pexpert.h>
++#include <kern/processor.h>
 +
 +extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
 +extern kern_return_t thread_terminate(thread_t);
@@ -695,16 +696,6 @@
 +	(void)thread_terminate(current_thread());
 +}
 +
-+static void
-+g_dump_range(vm_offset_t va, uint32_t from, uint32_t to)
-+{
-+	for (uint32_t o = from; o < to; o += 16) {
-+		printf("SWEET CPUF[%03x] %08x %08x %08x %08x\n", o,
-+		    *(volatile uint32_t *)(va + o), *(volatile uint32_t *)(va + o + 4),
-+		    *(volatile uint32_t *)(va + o + 8), *(volatile uint32_t *)(va + o + 12));
-+	}
-+}
-+
 +/* Rough CPU speed: iterations/us of a 1-cycle-per-iteration loop timed with the 19.2 MHz counter. */
 +static unsigned
 +g_loop_mhz(uint64_t *mpidr_out)
@@ -725,32 +716,79 @@
 +	return (unsigned)best;
 +}
 +
++static unsigned
++g_loop_mhz_on(int cpu, uint64_t *mpidr_out)
++{
++	unsigned mhz;
++	thread_bind(cpu_to_processor(cpu));
++	thread_block(THREAD_CONTINUE_NULL);
++	mhz = g_loop_mhz(mpidr_out);
++	thread_bind(PROCESSOR_NULL);
++	return mhz;
++}
++
++static void
++g_bench_all(const char *tag)
++{
++	static const int cpus[] = { 0, 3, 5, 6, 7 };
++	for (unsigned i = 0; i < sizeof(cpus) / sizeof(cpus[0]); i++) {
++		uint64_t mp = 0;
++		unsigned mhz = g_loop_mhz_on(cpus[i], &mp);
++		printf("SWEET CPUF: %s cpu%d (mpidr 0x%llx) ~%u MHz\n", tag, cpus[i],
++		    (unsigned long long)(mp & 0xff00), mhz);
++	}
++}
++
++/*
++ * EPSS cpufreq-hw (qcom,cpufreq-hw-epss): per cluster a LUT at +0x100 (freq =
++ * (entry & 0xff) * 19.2 MHz), and the requested LUT index at +0x320. Nothing
++ * else ever writes it here, so the clusters sit wherever ABL left them (A55 at
++ * step 6 of 9 = 1517 MHz, A76 at step 0 = 691 MHz). Boot-arg sweetcpuf:
++ * 0 = leave alone, 1 (default) = top step, N>=2 = step N-2.
++ */
 +static void
 +g_cpufreq_thread(void *arg, wait_result_t w)
 +{
++	int mode = 1;
++	vm_offset_t dom[2] = { 0, 0 };
 +	(void)arg;
 +	(void)w;
-+	g_wait(25000);
++	PE_parse_boot_argn("sweetcpuf", &mode, sizeof(mode));
++	g_wait(4000);
 +	for (int d = 0; d < 2; d++) {
 +		uint64_t pa = d ? 0x0fd92000ULL : 0x0fd91000ULL;
-+		printf("SWEET CPUF: domain %d PA 0x%llx ...\n", d, (unsigned long long)pa);
-+		vm_offset_t va = ml_io_map((vm_offset_t)pa, 0x1000);
-+		if (!va) {
-+			printf("SWEET CPUF: map failed\n");
++		dom[d] = ml_io_map((vm_offset_t)pa, 0x1000);
++	}
++	g_bench_all("before");
++	for (int d = 0; d < 2 && mode != 0; d++) {
++		if (!dom[d]) {
 +			continue;
 +		}
-+		g_dump_range(va, 0x000, 0x020);
-+		g_dump_range(va, 0x100, 0x140);   /* freq LUT */
-+		g_dump_range(va, 0x200, 0x240);   /* volt LUT */
-+		g_dump_range(va, 0x300, 0x340);   /* perf state / vote */
-+		g_dump_range(va, 0x3c0, 0x3d0);   /* cycle counter */
++		uint32_t top = 0;
++		while (top < 11 && (*(volatile uint32_t *)(dom[d] + 0x100 + 4 * (top + 1)) & 0xff) >
++		    (*(volatile uint32_t *)(dom[d] + 0x100 + 4 * top) & 0xff)) {
++			top++;
++		}
++		uint32_t want = (mode == 1) ? top : (uint32_t)(mode - 2);
++		if (want > top) {
++			want = top;
++		}
++		uint32_t was = *(volatile uint32_t *)(dom[d] + 0x320);
++		*(volatile uint32_t *)(dom[d] + 0x320) = want;
++		__asm__ volatile ("dsb sy" ::: "memory");
++		g_wait(100);
++		printf("SWEET CPUF: domain %d step %u -> %u (top %u, now reads %u, ~%u MHz)\n", d, was, want, top,
++		    *(volatile uint32_t *)(dom[d] + 0x320),
++		    (*(volatile uint32_t *)(dom[d] + 0x100 + 4 * want) & 0xff) * 192 / 10);
 +	}
-+	for (int k = 0; k < 8; k++) {
-+		uint64_t mp = 0;
-+		unsigned mhz = g_loop_mhz(&mp);
-+		printf("SWEET CPUF: speed test %d: core mpidr 0x%llx ~%u M loops/s\n", k,
-+		    (unsigned long long)(mp & 0xff00), mhz);
-+		g_wait(400);
++	g_wait(500);
++	g_bench_all("after");
++	g_wait(20000);
++	g_bench_all("later");
++	for (int d = 0; d < 2; d++) {
++		if (dom[d]) {
++			printf("SWEET CPUF: domain %d perf-state reg now %u\n", d, *(volatile uint32_t *)(dom[d] + 0x320));
++		}
 +	}
 +	printf("SWEET CPUF: done\n");
 +	(void)thread_terminate(current_thread());
