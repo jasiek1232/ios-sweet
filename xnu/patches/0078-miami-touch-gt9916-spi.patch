@@ -663,7 +663,7 @@
 +	(void)thread_terminate(current_thread());
 +}
 +
-+extern void sweet_usb_probe(void);
++extern void sweet_usb_start_direct(vm_offset_t dwc);
 +
 +static void
 +g_usbmain_thread(void *arg, wait_result_t w)
@@ -689,7 +689,7 @@
 +	PE_parse_boot_argn("sweetusb", &mode, sizeof(mode));
 +	if (mode >= 2) {
 +		printf("SWEET USBP: starting USB device bring-up (sweetusb=%d)\n", mode);
-+		sweet_usb_probe();
++		sweet_usb_start_direct(va);
 +		printf("SWEET USBP: bring-up call returned\n");
 +	}
 +	(void)thread_terminate(current_thread());

@@ -1,0 +1,26 @@
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index 31558d9..ac26e7b 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -865,6 +865,7 @@ sweet_usb_gadget_start(vm_offset_t dwc)
+ 	}
+ 	ud.dma_pa = ptoa_64(pn);
+ 	ud_if_create();
++	printf("SWEET USB: DMA ok pa=0x%llx, about to soft-reset the device controller\n", ud.dma_pa);
+ 
+ 	/* Device controller soft reset (PHY and global setup stay as ABL left them). */
+ 	dwc_wr(DCTL, DCTL_CSFTRST);
+@@ -928,4 +929,13 @@ sweet_usb_gadget_start(vm_offset_t dwc)
+ 		thread_deallocate(thread);
+ 	}
+ }
++/* miami: entry used by the async diagnostic thread (sweet_touch_gt9916.c),
++ * which has already mapped the DWC3 registers and proven they answer. */
++void sweet_usb_start_direct(vm_offset_t dwc);
++void
++sweet_usb_start_direct(vm_offset_t dwc)
++{
++	printf("SWEET USB: direct start\n");
++	sweet_usb_gadget_start(dwc);
++}
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
