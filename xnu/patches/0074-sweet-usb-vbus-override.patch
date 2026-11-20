@@ -10,7 +10,7 @@
 + * session; Linux dwc3-qcom forces that in software when the charger
 + * reports a cable (dwc3_qcom_vbus_override_enable).
 + */
-+#define QSCRATCH_PA             0x0a6f8800
++#define QSCRATCH_PA             0x04ef8800
 +#define QSCRATCH_HS_PHY_CTRL    0x10
 +#define   UTMI_OTG_VBUS_VALID   (1u << 20)
 +#define   SW_SESSVLD_SEL        (1u << 28)

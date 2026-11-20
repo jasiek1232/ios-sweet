@@ -18,7 +18,7 @@
 +static void sweet_usb_gadget_start(vm_offset_t dwc);
 +extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
  
- #define GCC_PA                  0x00100000
+ #define GCC_PA                  0x01400000
  #define GCC_SIZE                0x00090000
 @@ -56,6 +65,7 @@
  	uint32_t gdscr, cbcr[sizeof(usb_cbcr) / sizeof(usb_cbcr[0])];
@@ -35,7 +35,7 @@
 +	if (enabled >= 2) {
 +		sweet_usb_gadget_start(dwc);
 +	}
- 	if (cbcr[5] & CBCR_CLK_OFF) {
+ 	if (1) { /* miami: PHY block differs, do not read */
  		printf("SWEET USB: ahb2phy clock off; QUSB2 PHY not read\n");
  		return;
 @@ -105,4 +118,386 @@

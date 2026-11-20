@@ -32,7 +32,7 @@
  		thread_deallocate(thread);
 --- /dev/null
 +++ b/bsd/dev/sweet_touch_gt9916.c
-@@ -0,0 +1,598 @@
+@@ -0,0 +1,606 @@
 +/*
 + * miami (Motorola Edge 30 Neo, SM6375): Goodix GT9916S touch over the GENI SPI engine.
 + *
@@ -582,6 +582,14 @@
 +	g.gcc = ml_io_map(G_GCC_PA, G_GCC_SIZE);
 +	g.tlmm = ml_io_map(G_TLMM_PA, G_TLMM_SIZE);
 +	g.se = ml_io_map(G_SE_PA, G_SE_SIZE);
++	/* SM6375 USB bring-up aid: raw GCC window around USB30_PRIM (read-only). */
++	if (g.gcc) {
++		for (uint32_t o = 0x1a000; o < 0x1a0c0; o += 16) {
++			printf("SWEET GCC[%05x] %08x %08x %08x %08x\n", o,
++			    *(volatile uint32_t *)(g.gcc + o), *(volatile uint32_t *)(g.gcc + o + 4),
++			    *(volatile uint32_t *)(g.gcc + o + 8), *(volatile uint32_t *)(g.gcc + o + 12));
++		}
++	}
 +	if (!g.gcc || !g.tlmm || !g.se) {
 +		printf("SWEET TOUCH9916: MMIO mapping failed\n");
 +		goto out;
