@@ -32,7 +32,7 @@
  		thread_deallocate(thread);
 --- /dev/null
 +++ b/bsd/dev/sweet_touch_gt9916.c
-@@ -0,0 +1,788 @@
+@@ -0,0 +1,791 @@
 +/*
 + * miami (Motorola Edge 30 Neo, SM6375): Goodix GT9916S touch over the GENI SPI engine.
 + *
@@ -715,6 +715,9 @@
 +	__asm__ volatile ("mrs %0, mpidr_el1" : "=r"(*mpidr_out));
 +	return (unsigned)best;
 +}
++
++/* defined in osfmk/kern/sched_prim.c, declared only under MACH_KERNEL_PRIVATE */
++extern processor_t thread_bind(processor_t);
 +
 +static unsigned
 +g_loop_mhz_on(int cpu, uint64_t *mpidr_out)
