@@ -32,7 +32,7 @@
  		thread_deallocate(thread);
 --- /dev/null
 +++ b/bsd/dev/sweet_touch_gt9916.c
-@@ -0,0 +1,1013 @@
+@@ -0,0 +1,1041 @@
 +/*
 + * miami (Motorola Edge 30 Neo, SM6375): Goodix GT9916S touch over the GENI SPI engine.
 + *
@@ -957,6 +957,34 @@
 +		__asm__ volatile ("dmb oshld" ::: "memory");
 +		printf("SWEET GPUS: %s = 0x%08x\n", regs[i].name, v);
 +		g_wait(1500);
++	}
++	if (stage == 5) {
++		/* some GDSCs poll CFG_GDSCR (GDSCR+4) for PWR_ON: show both for CX and GX */
++		static const struct { uint64_t pa; const char *name; } cfg[] = {
++			{ 0x0599106cULL, "CX GDSCR" }, { 0x05991070ULL, "CX CFG_GDSCR" },
++			{ 0x0599100cULL, "GX GDSCR" }, { 0x05991010ULL, "GX CFG_GDSCR" },
++			{ 0x05991014ULL, "GX +0x14" }, { 0x05991018ULL, "GX +0x18" },
++		};
++		for (unsigned i = 0; i < sizeof(cfg) / sizeof(cfg[0]); i++) {
++			printf("SWEET GPUS: reading %s PA 0x%llx ...\n", cfg[i].name, (unsigned long long)cfg[i].pa);
++			g_wait(300);
++			vm_offset_t va = g_gpu_map(cfg[i].pa);
++			uint32_t v = va ? *(volatile uint32_t *)va : 0xdeadbeef;
++			printf("SWEET GPUS: %s = 0x%08x\n", cfg[i].name, v);
++			g_wait(300);
++		}
++		(void)g_gdsc_on("GX", 0x0599100cULL);
++		g_wait(1500);
++		for (unsigned i = 0; i < 4; i++) {
++			vm_offset_t va = g_gpu_map(cfg[2 + (i & 1)].pa);
++			uint32_t v = va ? *(volatile uint32_t *)va : 0xdeadbeef;
++			printf("SWEET GPUS: later %s = 0x%08x\n", cfg[2 + (i & 1)].name, v);
++			g_wait(500);
++			if (i == 1) {
++				g_wait(2000);
++			}
++		}
++		goto out;
 +	}
 +	if (stage < 4) {
 +		goto out;
