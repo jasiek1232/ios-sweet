@@ -32,7 +32,7 @@
  		thread_deallocate(thread);
 --- /dev/null
 +++ b/bsd/dev/sweet_touch_gt9916.c
-@@ -0,0 +1,1006 @@
+@@ -0,0 +1,1013 @@
 +/*
 + * miami (Motorola Edge 30 Neo, SM6375): Goodix GT9916S touch over the GENI SPI engine.
 + *
@@ -937,17 +937,19 @@
 +static void
 +g_gpuspmi_thread(void *arg, wait_result_t w)
 +{
-+	(void)arg;
++	int stage = (int)(uintptr_t)arg;
 +	(void)w;
++	printf("SWEET GPUS: thread entered, stage %d, waiting 20 s\n", stage);
 +	g_wait(20000);
-+	printf("SWEET GPUS: start\n");
++	printf("SWEET GPUS: start stage %d\n", stage);
++	g_wait(500);
 +	(void)g_gdsc_on("CX", 0x0599106cULL);
 +	static const struct { uint64_t pa; const char *name; } regs[] = {
 +		{ 0x0599e000ULL, "cx_misc +0" }, { 0x05961000ULL, "cx_dbgc +0" },
 +		{ 0x0596a000ULL, "gmu_wrapper +0" }, { 0x05991078ULL, "GPUCC +0x1078" },
 +		{ 0x05991098ULL, "GPUCC +0x1098" },
 +	};
-+	for (unsigned i = 0; i < sizeof(regs) / sizeof(regs[0]); i++) {
++	for (unsigned i = 0; stage == 3 && i < sizeof(regs) / sizeof(regs[0]); i++) {
 +		printf("SWEET GPUS: reading %s PA 0x%llx ...\n", regs[i].name, (unsigned long long)regs[i].pa);
 +		g_wait(1500);
 +		vm_offset_t va = g_gpu_map(regs[i].pa);
@@ -955,6 +957,9 @@
 +		__asm__ volatile ("dmb oshld" ::: "memory");
 +		printf("SWEET GPUS: %s = 0x%08x\n", regs[i].name, v);
 +		g_wait(1500);
++	}
++	if (stage < 4) {
++		goto out;
 +	}
 +	vm_offset_t core = ml_io_map(0x01c40000u, 0x2000);
 +	vm_offset_t cnfg = ml_io_map(0x01c0a000u, 0x1000);
@@ -978,6 +983,8 @@
 +		}
 +		uint32_t owner = g_mrd(cnfg, 0x700u + 4u * i) & 7u;
 +		uint8_t ty = 0xee, sub = 0xee;
++		printf("SWEET GPUS: reading apid %u ppid 0x%03x owner %u ...\n", i, ppid, owner);
++		g_wait(150);
 +		int ok = g_spmi_rd(obs, (uint16_t)i, 0x04, &ty) && g_spmi_rd(obs, (uint16_t)i, 0x05, &sub);
 +		printf("SWEET GPUS: apid %u ppid 0x%03x (sid %u base 0x%02x00) owner %u type 0x%02x sub 0x%02x%s\n",
 +		    i, ppid, sid, pg, owner, ty, sub, ok ? "" : " (read failed)");
@@ -1035,7 +1042,7 @@
 +	} else if (gp == 2) {
 +		g_spawn(g_gpuup_thread, NULL);
 +	} else if (gp >= 3) {
-+		g_spawn(g_gpuspmi_thread, NULL);
++		g_spawn(g_gpuspmi_thread, (void *)(uintptr_t)gp);
 +	}
 +}
 +#endif /* ARM64_BOARD_CONFIG_SWEET */
