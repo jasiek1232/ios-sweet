@@ -32,7 +32,7 @@
  		thread_deallocate(thread);
 --- /dev/null
 +++ b/bsd/dev/sweet_touch_gt9916.c
-@@ -0,0 +1,791 @@
+@@ -0,0 +1,807 @@
 +/*
 + * miami (Motorola Edge 30 Neo, SM6375): Goodix GT9916S touch over the GENI SPI engine.
 + *
@@ -822,5 +822,21 @@
 +	g_spawn(g_usbp_thread, (void *)(uintptr_t)0x01630000ULL);
 +	g_spawn(g_usbmain_thread, NULL);
 +	g_spawn(g_cpufreq_thread, NULL);
++	/*
++	 * sweetgpuprobe=1: read-only look at the Adreno 619 blocks (one thread per register,
++	 * the line printed before the read names a block that hangs). GPUCC GDSCRs, kgsl SMMU,
++	 * GPU RBBM_STATUS, cx_dbgc, GMU wrapper, cx_misc.
++	 */
++	int gp = 0;
++	PE_parse_boot_argn("sweetgpuprobe", &gp, sizeof(gp));
++	if (gp) {
++		static const uint64_t gpu_pas[] = {
++			0x0599106cULL, 0x0599100cULL, 0x05940000ULL, 0x05940020ULL,
++			0x05900840ULL, 0x05961000ULL, 0x0596a000ULL, 0x0599e000ULL,
++		};
++		for (unsigned i = 0; i < sizeof(gpu_pas) / sizeof(gpu_pas[0]); i++) {
++			g_spawn(g_usbp_thread, (void *)(uintptr_t)gpu_pas[i]);
++		}
++	}
 +}
 +#endif /* ARM64_BOARD_CONFIG_SWEET */
