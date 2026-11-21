@@ -32,7 +32,7 @@
  		thread_deallocate(thread);
 --- /dev/null
 +++ b/bsd/dev/sweet_touch_gt9916.c
-@@ -0,0 +1,838 @@
+@@ -0,0 +1,906 @@
 +/*
 + * miami (Motorola Edge 30 Neo, SM6375): Goodix GT9916S touch over the GENI SPI engine.
 + *
@@ -834,6 +834,72 @@
 +	(void)thread_terminate(current_thread());
 +}
 +
++/*
++ * sweetgpuprobe=2: first power-up attempt. Clear SW_COLLAPSE on the GPU CX GDSC, then on GX,
++ * reading back each GDSCR (bit31 = PWR_ON). The GPU registers are only read when both domains
++ * report on; otherwise the thread stops with the GDSC status so nothing touches unpowered logic.
++ */
++static vm_offset_t
++g_gpu_map(uint64_t pa)
++{
++	return ml_io_map((vm_offset_t)(pa & ~0xfffULL), 0x1000) + (vm_offset_t)(pa & 0xfffULL);
++}
++
++static int
++g_gdsc_on(const char *name, uint64_t pa)
++{
++	vm_offset_t va = g_gpu_map(pa);
++	if (!va) {
++		printf("SWEET GPUUP: %s map failed\n", name);
++		return 0;
++	}
++	uint32_t v = *(volatile uint32_t *)va;
++	printf("SWEET GPUUP: %s GDSCR before = 0x%08x\n", name, v);
++	g_wait(1500);
++	printf("SWEET GPUUP: %s clearing SW_COLLAPSE ...\n", name);
++	g_wait(1500);
++	*(volatile uint32_t *)va = v & ~1u;
++	__asm__ volatile ("dsb sy" ::: "memory");
++	for (int i = 0; i < 20; i++) {
++		g_wait(10);
++		v = *(volatile uint32_t *)va;
++		if (v & 0x80000000u) {
++			break;
++		}
++	}
++	printf("SWEET GPUUP: %s GDSCR after = 0x%08x (%s)\n", name, v, (v & 0x80000000u) ? "ON" : "still OFF");
++	g_wait(1500);
++	return (v & 0x80000000u) != 0;
++}
++
++static void
++g_gpuup_thread(void *arg, wait_result_t w)
++{
++	(void)arg;
++	(void)w;
++	g_wait(20000);
++	printf("SWEET GPUUP: start\n");
++	if (g_gdsc_on("CX", 0x0599106cULL) && g_gdsc_on("GX", 0x0599100cULL)) {
++		static const struct { uint64_t pa; const char *name; } regs[] = {
++			{ 0x05900840ULL, "GPU RBBM_STATUS" }, { 0x05900804ULL, "GPU RBBM_INT_0_STATUS" },
++			{ 0x05991078ULL, "GPUCC +0x1078" }, { 0x05991098ULL, "GPUCC +0x1098" },
++		};
++		for (unsigned i = 0; i < sizeof(regs) / sizeof(regs[0]); i++) {
++			printf("SWEET GPUUP: reading %s PA 0x%llx ...\n", regs[i].name, (unsigned long long)regs[i].pa);
++			g_wait(1500);
++			vm_offset_t va = g_gpu_map(regs[i].pa);
++			uint32_t v = va ? *(volatile uint32_t *)va : 0xdeadbeef;
++			__asm__ volatile ("dmb oshld" ::: "memory");
++			printf("SWEET GPUUP: %s = 0x%08x\n", regs[i].name, v);
++			g_wait(1500);
++		}
++	} else {
++		printf("SWEET GPUUP: power domain did not come on, not touching GPU registers\n");
++	}
++	printf("SWEET GPUUP: done\n");
++	(void)thread_terminate(current_thread());
++}
++
 +static void
 +g_spawn(thread_continue_t fn, void *arg)
 +{
@@ -866,8 +932,10 @@
 +	 */
 +	int gp = 0;
 +	PE_parse_boot_argn("sweetgpuprobe", &gp, sizeof(gp));
-+	if (gp) {
++	if (gp == 1) {
 +		g_spawn(g_gpuwalk_thread, NULL);
++	} else if (gp >= 2) {
++		g_spawn(g_gpuup_thread, NULL);
 +	}
 +}
 +#endif /* ARM64_BOARD_CONFIG_SWEET */
