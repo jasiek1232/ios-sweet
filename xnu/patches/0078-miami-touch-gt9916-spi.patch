@@ -32,7 +32,7 @@
  		thread_deallocate(thread);
 --- /dev/null
 +++ b/bsd/dev/sweet_touch_gt9916.c
-@@ -0,0 +1,1462 @@
+@@ -0,0 +1,1463 @@
 +/*
 + * miami (Motorola Edge 30 Neo, SM6375): Goodix GT9916S touch over the GENI SPI engine.
 + *
@@ -62,6 +62,7 @@
 +
 +extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
 +extern kern_return_t thread_terminate(thread_t);
++extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
 +extern void sweet_hid_touch(int finger, int down, int x, int y);
 +void sweet_touch_gt9916_start(void);
 +
