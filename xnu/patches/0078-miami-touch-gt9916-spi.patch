@@ -32,7 +32,7 @@
  		thread_deallocate(thread);
 --- /dev/null
 +++ b/bsd/dev/sweet_touch_gt9916.c
-@@ -0,0 +1,1041 @@
+@@ -0,0 +1,1115 @@
 +/*
 + * miami (Motorola Edge 30 Neo, SM6375): Goodix GT9916S touch over the GENI SPI engine.
 + *
@@ -934,6 +934,76 @@
 +	return 0;
 +}
 +
++/*
++ * sweetgpuprobe=6: full GX power-up as in mainline gpucc-sm6375/gdsc.c: pulse the GX block
++ * resets, pulse the AON reset and drop the IO clamp, then clear SW_COLLAPSE and poll PWR_ON.
++ * Only the GPUCC registers are touched, never the GPU core itself.
++ */
++static void
++g_w32(const char *what, vm_offset_t va, uint32_t val)
++{
++	printf("SWEET GPUX: write %s <- 0x%08x ...\n", what, val);
++	g_wait(200);
++	*(volatile uint32_t *)va = val;
++	__asm__ volatile ("dsb sy" ::: "memory");
++	(void)*(volatile uint32_t *)va;
++}
++
++static void
++g_gx_sequence(void)
++{
++	vm_offset_t cc = g_gpu_map(0x05991000ULL) - 0;
++	vm_offset_t cc8 = g_gpu_map(0x05998000ULL);
++	if (!cc || !cc8) {
++		printf("SWEET GPUX: map failed\n");
++		return;
++	}
++	volatile uint32_t *gdscr = (volatile uint32_t *)(cc + 0x00c);
++	volatile uint32_t *cfg = (volatile uint32_t *)(cc + 0x010);
++	volatile uint32_t *bcr_gx = (volatile uint32_t *)(cc + 0x008);
++	volatile uint32_t *bcr_acd = (volatile uint32_t *)(cc + 0x160);
++	volatile uint32_t *bcr_misc = (volatile uint32_t *)(cc8 + 0x004);
++	volatile uint32_t *clamp = (volatile uint32_t *)(cc + 0x508);
++	printf("SWEET GPUX: start GDSCR 0x%08x CFG 0x%08x BCR 0x%08x/0x%08x/0x%08x clamp 0x%08x\n",
++	    *gdscr, *cfg, *bcr_gx, *bcr_acd, *bcr_misc, *clamp);
++	g_wait(1000);
++	/* back to a clean collapsed state first */
++	g_w32("GX GDSCR collapse", (vm_offset_t)gdscr, *gdscr | 1u);
++	g_wait(100);
++	printf("SWEET GPUX: GDSCR now 0x%08x CFG 0x%08x\n", *gdscr, *cfg);
++	g_wait(500);
++	/* assert resets */
++	g_w32("GX_BCR assert", (vm_offset_t)bcr_gx, *bcr_gx | 1u);
++	g_w32("ACD_BCR assert", (vm_offset_t)bcr_acd, *bcr_acd | 1u);
++	g_w32("GX_ACD_MISC_BCR assert", (vm_offset_t)bcr_misc, *bcr_misc | 1u);
++	g_wait(10);
++	g_w32("GX_BCR deassert", (vm_offset_t)bcr_gx, *bcr_gx & ~1u);
++	g_w32("ACD_BCR deassert", (vm_offset_t)bcr_acd, *bcr_acd & ~1u);
++	g_w32("GX_ACD_MISC_BCR deassert", (vm_offset_t)bcr_misc, *bcr_misc & ~1u);
++	g_wait(500);
++	/* AON reset pulse (bit 4), then release the IO clamp (bit 0) */
++	g_w32("clamp_io AON reset", (vm_offset_t)clamp, *clamp | 0x10u);
++	g_wait(5);
++	g_w32("clamp_io AON reset off", (vm_offset_t)clamp, *clamp & ~0x10u);
++	g_w32("clamp_io release", (vm_offset_t)clamp, *clamp & ~1u);
++	g_wait(500);
++	printf("SWEET GPUX: clamp ctrl now 0x%08x\n", *clamp);
++	g_wait(500);
++	g_w32("GX GDSCR enable", (vm_offset_t)gdscr, *gdscr & ~1u);
++	uint32_t v = 0;
++	for (int i = 0; i < 50; i++) {
++		g_wait(10);
++		v = *gdscr;
++		if (v & 0x80000000u) {
++			break;
++		}
++	}
++	printf("SWEET GPUX: GX GDSCR = 0x%08x CFG 0x%08x (%s)\n", v, *cfg, (v & 0x80000000u) ? "ON" : "still OFF");
++	g_wait(1500);
++	printf("SWEET GPUX: later GDSCR 0x%08x CFG 0x%08x\n", *gdscr, *cfg);
++	g_wait(500);
++}
++
 +static void
 +g_gpuspmi_thread(void *arg, wait_result_t w)
 +{
@@ -957,6 +1027,10 @@
 +		__asm__ volatile ("dmb oshld" ::: "memory");
 +		printf("SWEET GPUS: %s = 0x%08x\n", regs[i].name, v);
 +		g_wait(1500);
++	}
++	if (stage == 6) {
++		g_gx_sequence();
++		goto out;
 +	}
 +	if (stage == 5) {
 +		/* some GDSCs poll CFG_GDSCR (GDSCR+4) for PWR_ON: show both for CX and GX */
