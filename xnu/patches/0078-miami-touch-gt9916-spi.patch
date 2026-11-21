@@ -32,7 +32,7 @@
  		thread_deallocate(thread);
 --- /dev/null
 +++ b/bsd/dev/sweet_touch_gt9916.c
-@@ -0,0 +1,1289 @@
+@@ -0,0 +1,1354 @@
 +/*
 + * miami (Motorola Edge 30 Neo, SM6375): Goodix GT9916S touch over the GENI SPI engine.
 + *
@@ -1066,7 +1066,8 @@
 +	*(volatile uint32_t *)va = 0x12345678u;
 +	__asm__ volatile ("dsb sy" ::: "memory");
 +	uint32_t now = *(volatile uint32_t *)va;
-+	printf("SWEET GPUR: CP_RB_BASE readback = 0x%08x (%s)\n", now, now == 0x12345678u ? "REGISTERS LIVE" : "no effect");
++	printf("SWEET GPUR: CP_RB_BASE readback = 0x%08x (%s)\n", now,
++	    (now & ~0x1fu) == 0x12345660u ? "REGISTERS LIVE (low 5 bits are alignment-masked)" : (now == 0 ? "no effect" : "changed, unexpected"));
 +	g_wait(1000);
 +	*(volatile uint32_t *)va = old;
 +	__asm__ volatile ("dsb sy" ::: "memory");
@@ -1169,6 +1170,66 @@
 +	return 1;
 +}
 +
++/*
++ * stage 10: read-only dump of the GPU (kgsl) SMMU: global registers, stream matching and
++ * context bank 0. Prints each register name before the read.
++ */
++static uint32_t
++g_smmu_rd(const char *name, uint64_t pa)
++{
++	vm_offset_t va = g_gpu_map(pa);
++	printf("SWEET GPUM: reading %s PA 0x%llx ...\n", name, (unsigned long long)pa);
++	g_wait(100);
++	uint32_t v = va ? *(volatile uint32_t *)va : 0xdeadbeef;
++	__asm__ volatile ("dmb oshld" ::: "memory");
++	printf("SWEET GPUM: %s = 0x%08x\n", name, v);
++	g_wait(100);
++	return v;
++}
++
++static void
++g_smmu_dump(void)
++{
++	const uint64_t base = 0x05940000ULL;
++	uint32_t idr0 = g_smmu_rd("IDR0", base + 0x20);
++	uint32_t idr1 = g_smmu_rd("IDR1", base + 0x24);
++	(void)g_smmu_rd("IDR2", base + 0x28);
++	(void)g_smmu_rd("sCR0", base + 0x00);
++	(void)g_smmu_rd("sCR1", base + 0x04);
++	(void)g_smmu_rd("sCR2", base + 0x08);
++	(void)g_smmu_rd("sACR", base + 0x10);
++	(void)g_smmu_rd("sGFSR", base + 0x48);
++	(void)g_smmu_rd("sGFSYNR0", base + 0x50);
++	uint32_t nsmr = idr0 & 0xffu;
++	uint32_t ncb = idr1 & 0xffu;
++	printf("SWEET GPUM: IDR0 NUMSMRG=%u IDR1 NUMCB=%u NUMPAGENDXB=%u PAGESIZE=%s\n", nsmr, ncb,
++	    (idr1 >> 28) & 7u, (idr1 & 0x80000000u) ? "64K" : "4K");
++	g_wait(300);
++	if (nsmr > 8) {
++		nsmr = 8;
++	}
++	for (uint32_t i = 0; i < nsmr; i++) {
++		char nm[16];
++		snprintf(nm, sizeof(nm), "SMR%u", i);
++		(void)g_smmu_rd(nm, base + 0x800 + 4u * i);
++		snprintf(nm, sizeof(nm), "S2CR%u", i);
++		(void)g_smmu_rd(nm, base + 0xc00 + 4u * i);
++	}
++	/* context banks start in the upper half of the SMMU register space */
++	uint32_t pgsz = (idr1 & 0x80000000u) ? 0x10000u : 0x1000u;
++	uint32_t numpage = 1u << (((idr1 >> 28) & 7u) + 1u);
++	uint64_t cb = base + (uint64_t)numpage * pgsz / 2u;
++	printf("SWEET GPUM: context bank 0 assumed at PA 0x%llx\n", (unsigned long long)cb);
++	g_wait(300);
++	(void)g_smmu_rd("CB0 SCTLR", cb + 0x00);
++	(void)g_smmu_rd("CB0 ACTLR", cb + 0x04);
++	(void)g_smmu_rd("CB0 TTBR0 lo", cb + 0x20);
++	(void)g_smmu_rd("CB0 TTBR0 hi", cb + 0x24);
++	(void)g_smmu_rd("CB0 TCR", cb + 0x30);
++	(void)g_smmu_rd("CB0 MAIR0", cb + 0x38);
++	(void)g_smmu_rd("CB0 FSR", cb + 0x58);
++}
++
 +static void
 +g_gpuspmi_thread(void *arg, wait_result_t w)
 +{
@@ -1193,7 +1254,11 @@
 +		printf("SWEET GPUS: %s = 0x%08x\n", regs[i].name, v);
 +		g_wait(1500);
 +	}
-+	if (stage >= 6) {
++	if (stage == 10) {
++		g_smmu_dump();
++		goto out;
++	}
++	if (stage >= 6 && stage < 10) {
 +		int on = g_gx_sequence();
 +		if (stage >= 7 && on) {
 +			g_gpu_core_probe();
