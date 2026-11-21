@@ -32,7 +32,7 @@
  		thread_deallocate(thread);
 --- /dev/null
 +++ b/bsd/dev/sweet_touch_gt9916.c
-@@ -0,0 +1,807 @@
+@@ -0,0 +1,838 @@
 +/*
 + * miami (Motorola Edge 30 Neo, SM6375): Goodix GT9916S touch over the GENI SPI engine.
 + *
@@ -797,6 +797,43 @@
 +	(void)thread_terminate(current_thread());
 +}
 +
++/*
++ * sweetgpuprobe=1: walk the Adreno 619 blocks one register at a time, safest first, a pause
++ * between reads so the log (USB live 100 ms, userdata ring ~1 s) has flushed the line
++ * printed before the read. The last "reading" line without a result names the culprit.
++ */
++static void
++g_gpuwalk_thread(void *arg, wait_result_t w)
++{
++	static const struct { uint64_t pa; const char *name; } regs[] = {
++		{ 0x0599106cULL, "GPUCC CX_GDSCR" }, { 0x0599100cULL, "GPUCC GX_GDSCR" },
++		{ 0x05990000ULL, "GPUCC +0x0" }, { 0x05991078ULL, "GPUCC +0x1078" },
++		{ 0x05991098ULL, "GPUCC +0x1098" }, { 0x0599109cULL, "GPUCC +0x109c" },
++		{ 0x05940000ULL, "KGSL-SMMU sCR0" }, { 0x05940020ULL, "KGSL-SMMU IDR0" },
++		{ 0x0599e000ULL, "cx_misc +0" }, { 0x05961000ULL, "cx_dbgc +0" },
++		{ 0x0596a000ULL, "gmu_wrapper +0" }, { 0x05900840ULL, "GPU RBBM_STATUS" },
++	};
++	(void)arg;
++	(void)w;
++	g_wait(20000);
++	printf("SWEET GPUW: walk start\n");
++	for (unsigned i = 0; i < sizeof(regs) / sizeof(regs[0]); i++) {
++		printf("SWEET GPUW: reading %s PA 0x%llx ...\n", regs[i].name, (unsigned long long)regs[i].pa);
++		g_wait(1500);
++		vm_offset_t va = ml_io_map((vm_offset_t)(regs[i].pa & ~0xfffULL), 0x1000);
++		if (!va) {
++			printf("SWEET GPUW: map failed\n");
++			continue;
++		}
++		uint32_t v = *(volatile uint32_t *)(va + (regs[i].pa & 0xfffULL));
++		__asm__ volatile ("dmb oshld" ::: "memory");
++		printf("SWEET GPUW: %s = 0x%08x\n", regs[i].name, v);
++		g_wait(1500);
++	}
++	printf("SWEET GPUW: walk done\n");
++	(void)thread_terminate(current_thread());
++}
++
 +static void
 +g_spawn(thread_continue_t fn, void *arg)
 +{
@@ -830,13 +867,7 @@
 +	int gp = 0;
 +	PE_parse_boot_argn("sweetgpuprobe", &gp, sizeof(gp));
 +	if (gp) {
-+		static const uint64_t gpu_pas[] = {
-+			0x0599106cULL, 0x0599100cULL, 0x05940000ULL, 0x05940020ULL,
-+			0x05900840ULL, 0x05961000ULL, 0x0596a000ULL, 0x0599e000ULL,
-+		};
-+		for (unsigned i = 0; i < sizeof(gpu_pas) / sizeof(gpu_pas[0]); i++) {
-+			g_spawn(g_usbp_thread, (void *)(uintptr_t)gpu_pas[i]);
-+		}
++		g_spawn(g_gpuwalk_thread, NULL);
 +	}
 +}
 +#endif /* ARM64_BOARD_CONFIG_SWEET */
