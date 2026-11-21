@@ -32,7 +32,7 @@
  		thread_deallocate(thread);
 --- /dev/null
 +++ b/bsd/dev/sweet_touch_gt9916.c
-@@ -0,0 +1,1354 @@
+@@ -0,0 +1,1462 @@
 +/*
 + * miami (Motorola Edge 30 Neo, SM6375): Goodix GT9916S touch over the GENI SPI engine.
 + *
@@ -56,6 +56,9 @@
 +#include <machine/machine_routines.h>
 +#include <pexpert/pexpert.h>
 +#include <kern/processor.h>
++#include <arm/caches_internal.h>
++#include <vm/pmap.h>
++#include <vm/vm_kern.h>
 +
 +extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
 +extern kern_return_t thread_terminate(thread_t);
@@ -1230,6 +1233,107 @@
 +	(void)g_smmu_rd("CB0 FSR", cb + 0x58);
 +}
 +
++/*
++ * stage 11: program the GPU SMMU like the arm-smmu driver would (stream id 0 -> context bank 0,
++ * stage 1, AArch64 3-level 4K tables, 39-bit IOVA) and check it from the CPU with the SMMU's own
++ * address-translation op (ATS1PR): IOVA 0x5000 must come back as the physical page we mapped.
++ * No GPU traffic is involved. Context banks start at base + 0x8000 (half of the 64 KiB window).
++ */
++static void
++g_smmu_wr(const char *name, uint64_t pa, uint32_t val)
++{
++	vm_offset_t va = g_gpu_map(pa);
++	printf("SWEET GPUT: write %s PA 0x%llx <- 0x%08x ...\n", name, (unsigned long long)pa, val);
++	g_wait(150);
++	*(volatile uint32_t *)va = val;
++	__asm__ volatile ("dsb sy" ::: "memory");
++	uint32_t back = *(volatile uint32_t *)va;
++	printf("SWEET GPUT: %s reads back 0x%08x\n", name, back);
++	g_wait(150);
++}
++
++static uint32_t
++g_smmu_r(const char *name, uint64_t pa)
++{
++	vm_offset_t va = g_gpu_map(pa);
++	printf("SWEET GPUT: reading %s PA 0x%llx ...\n", name, (unsigned long long)pa);
++	g_wait(120);
++	uint32_t v = *(volatile uint32_t *)va;
++	printf("SWEET GPUT: %s = 0x%08x\n", name, v);
++	g_wait(120);
++	return v;
++}
++
++static void
++g_smmu_setup_test(void)
++{
++	const uint64_t base = 0x05940000ULL;
++	const uint64_t cb = base + 0x8000ULL;
++	/* what is really in the context bank window and the CBAR/CBA2R pages */
++	(void)g_smmu_r("CB0 SCTLR", cb + 0x00);
++	(void)g_smmu_r("CB0 TCR", cb + 0x30);
++	(void)g_smmu_r("GR1 CBAR0", base + 0x1000);
++	(void)g_smmu_r("GR1 CBA2R0", base + 0x1800);
++
++	vm_offset_t mem = 0;
++	if (kmem_alloc_contig(kernel_map, &mem, 4 * PAGE_SIZE, PAGE_MASK, 0, 0,
++	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		printf("SWEET GPUT: no memory for page tables\n");
++		return;
++	}
++	uint64_t pa0 = ptoa_64(pmap_find_phys(kernel_pmap, (addr64_t)mem));
++	/* 4 KiB tables, 4 KiB apart, in one physically contiguous block (the kernel page may be 16 KiB) */
++	uint64_t t1 = pa0, t2 = pa0 + 0x1000, t3 = pa0 + 0x2000, td = pa0 + 0x3000;
++	volatile uint64_t *l1 = (volatile uint64_t *)mem;
++	volatile uint64_t *l2 = (volatile uint64_t *)(mem + 0x1000);
++	volatile uint64_t *l3 = (volatile uint64_t *)(mem + 0x2000);
++	volatile uint32_t *data = (volatile uint32_t *)(mem + 0x3000);
++	printf("SWEET GPUT: tables PA l1 0x%llx l2 0x%llx l3 0x%llx data 0x%llx (PAGE_SIZE %u)\n",
++	    (unsigned long long)t1, (unsigned long long)t2, (unsigned long long)t3,
++	    (unsigned long long)td, (unsigned)PAGE_SIZE);
++	g_wait(300);
++	l1[0] = t2 | 3u;                        /* table */
++	l2[0] = t3 | 3u;                        /* table */
++	l3[5] = td | 0x743u;                    /* page: AF, inner shareable, AP RW, attr 0, valid */
++	data[0] = 0xcafef00du;
++	flush_dcache64((addr64_t)pa0, 0x4000, TRUE);
++	printf("SWEET GPUT: tables built, IOVA 0x5000 -> PA 0x%llx\n", (unsigned long long)td);
++	g_wait(300);
++
++	g_smmu_wr("SMR0", base + 0x800, 0x80000000u);                 /* valid, id 0, mask 0 */
++	g_smmu_wr("S2CR0", base + 0xc00, 0x00000000u);                /* translate via context bank 0 */
++	g_smmu_wr("CBA2R0", base + 0x1800, 0x00000001u);              /* AArch64 */
++	g_smmu_wr("CBAR0", base + 0x1000, (1u << 16) | (0xfu << 12) | (3u << 8)); /* stage 1, stage 2 bypass */
++	g_smmu_wr("CB0 TTBR0 lo", cb + 0x20, (uint32_t)t1);
++	g_smmu_wr("CB0 TTBR0 hi", cb + 0x24, (uint32_t)((t1 >> 32) | (1u << 16)));  /* ASID 1 */
++	g_smmu_wr("CB0 TCR2", cb + 0x10, 0x2u);                       /* 40-bit physical */
++	g_smmu_wr("CB0 TCR", cb + 0x30, 0x80803519u);                 /* EAE, T0SZ 25, 4K, inner sh, WB */
++	g_smmu_wr("CB0 MAIR0", cb + 0x38, 0x000000ffu);
++	g_smmu_wr("CB0 MAIR1", cb + 0x3c, 0x0u);
++	g_smmu_wr("CB0 SCTLR", cb, 0x67u);                            /* M|TRE|AFE|CFRE|CFIE */
++
++	vm_offset_t atsva = g_gpu_map(cb + 0x800);
++	printf("SWEET GPUT: ATS1PR translate IOVA 0x5000 ...\n");
++	g_wait(300);
++	*(volatile uint64_t *)atsva = 0x5000ULL;
++	__asm__ volatile ("dsb sy" ::: "memory");
++	vm_offset_t atsr = g_gpu_map(cb + 0x8f0);
++	uint32_t st = 1;
++	for (int i = 0; i < 100 && (st & 1u); i++) {
++		g_wait(1);
++		st = *(volatile uint32_t *)atsr;
++	}
++	uint64_t par = *(volatile uint64_t *)g_gpu_map(cb + 0x50);
++	printf("SWEET GPUT: ATSR 0x%08x PAR 0x%016llx FSR 0x%08x\n", st, (unsigned long long)par,
++	    *(volatile uint32_t *)g_gpu_map(cb + 0x58));
++	if (!(par & 1u) && (par & 0xfffffffff000ULL) == td) {
++		printf("SWEET GPUT: SMMU TRANSLATION OK (IOVA 0x5000 -> PA 0x%llx)\n", (unsigned long long)(par & 0xfffffffff000ULL));
++	} else {
++		printf("SWEET GPUT: translation did not give PA 0x%llx\n", (unsigned long long)td);
++	}
++	g_wait(500);
++}
++
 +static void
 +g_gpuspmi_thread(void *arg, wait_result_t w)
 +{
@@ -1256,6 +1360,10 @@
 +	}
 +	if (stage == 10) {
 +		g_smmu_dump();
++		goto out;
++	}
++	if (stage == 11) {
++		g_smmu_setup_test();
 +		goto out;
 +	}
 +	if (stage >= 6 && stage < 10) {
