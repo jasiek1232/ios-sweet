@@ -32,7 +32,7 @@
  		thread_deallocate(thread);
 --- /dev/null
 +++ b/bsd/dev/sweet_touch_gt9916.c
-@@ -0,0 +1,4760 @@
+@@ -0,0 +1,4721 @@
 +/*
 + * miami (Motorola Edge 30 Neo, SM6375): Goodix GT9916S touch over the GENI SPI engine.
 + *
@@ -4325,7 +4325,7 @@
 +	(void)g_smmu_r("sGFSR", 0x05940000ull + 0x48);
 +}
 +
-+static int
++__attribute__((optnone, noinline)) static int
 +g_ring_submit(volatile uint32_t *ring, uint64_t ring_pa, uint32_t *wptr, const uint32_t *pkt, unsigned n, const char *what)
 +{
 +	for (unsigned i = 0; i < n; i++)
@@ -4358,77 +4358,38 @@
 + * 2D engine's destination pitch needs, so the GPU cannot write the panel memory directly yet), and
 + * re-rendered with a moving colour so the square on the screen is visibly GPU-made.
 + */
-+static uint32_t
-+g_pkt4(uint32_t reg, uint32_t cnt)
-+{
-+	return 0x40000000u | cnt | (G_PM4_PAR(cnt) << 7) | ((reg & 0x3ffffu) << 8) | (G_PM4_PAR(reg) << 27);
-+}
-+
-+static const uint32_t g_blit_init[][2] = {
-+	{ 0x9804, 0x1f }, { 0x9805, 1 }, { 0xa0f8, 1 }, { 0xb600, 0x8000 }, { 0x8600, 0 },
-+	{ 0xae03, 0x420 }, { 0xae00, 0 }, { 0xbe04, 0 }, { 0x9600, 0x2000000 }, { 0x0e12, 1 },
-+	{ 0x8e01, 1 }, { 0x8e04, 0x4100000 }, { 0xae04, 0 }, { 0xae0f, 0x3f }, { 0xb605, 0x44 },
-+	{ 0xbe00, 0x80 }, { 0xbe01, 0 }, { 0xab20, 0 }, { 0xb182, 0 }, { 0xbb11, 0 }, { 0xa9a8, 0 },
-+	{ 0xab00, 5 }, { 0xa009, 3 }, { 0x8811, 0x10 }, { 0x8110, 0 }, { 0x8818, 0 }, { 0x8819, 0 },
-+	{ 0x881a, 0 }, { 0x881b, 0 }, { 0x881c, 0 }, { 0x881d, 0 }, { 0x881e, 0 }, { 0x88f0, 0 },
-+	{ 0x9236, 0 }, { 0x9300, 0 }, { 0x9306, 1 }, { 0xb183, 0 }, { 0x80af, 0 }, { 0x8099, 0 },
-+	{ 0x980a, 0 }, { 0x9210, 0 }, { 0x9211, 0 }, { 0x9602, 0 }, { 0x9e72, 0 }, { 0xb309, 0xa2 },
-+	{ 0xb986, 0xfc }, { 0xa007, 0 }, { 0x8864, 0 }, { 0xb800, 0x102 },
-+	{ 0x8e07, 0x10000000 },
++static const uint32_t g_blit_dw[174] = {
++	0x70460001, 0x00000031, 0x40bb0801, 0x000fffff, 0x70268000, 0x48980401, 0x0000001f, 0x40980501,
++	0x00000001, 0x40a0f801, 0x00000001, 0x40b60001, 0x00008000, 0x40860001, 0x00000000, 0x40ae0301,
++	0x00000420, 0x40ae0001, 0x00000000, 0x40be0401, 0x00000000, 0x48960001, 0x02000000, 0x400e1201,
++	0x00000001, 0x408e0101, 0x00000001, 0x408e0401, 0x04100000, 0x48ae0401, 0x00000000, 0x40ae0f01,
++	0x0000003f, 0x40b60501, 0x00000044, 0x48be0001, 0x00000080, 0x40be0101, 0x00000000, 0x48ab2001,
++	0x00000000, 0x48b18201, 0x00000000, 0x48bb1101, 0x00000000, 0x40a9a801, 0x00000000, 0x40ab0001,
++	0x00000005, 0x48a00901, 0x00000003, 0x48881101, 0x00000010, 0x40811001, 0x00000000, 0x48881801,
++	0x00000000, 0x40881901, 0x00000000, 0x40881a01, 0x00000000, 0x48881b01, 0x00000000, 0x40881c01,
++	0x00000000, 0x48881d01, 0x00000000, 0x48881e01, 0x00000000, 0x4888f001, 0x00000000, 0x40923601,
++	0x00000000, 0x48930001, 0x00000000, 0x48930601, 0x00000001, 0x40b18301, 0x00000000, 0x4080af01,
++	0x00000000, 0x40809901, 0x00000000, 0x40980a01, 0x00000000, 0x48921001, 0x00000000, 0x40921101,
++	0x00000000, 0x40960201, 0x00000000, 0x409e7201, 0x00000000, 0x40b30901, 0x000000a2, 0x48b98601,
++	0x000000fc, 0x40a00701, 0x00000000, 0x40886401, 0x00000000, 0x48b80001, 0x00000102, 0x408e0701,
++	0x10000000, 0x48b30202, 0x00004800, 0x00000000, 0x40b18002, 0x00004800, 0x00000000, 0x70460004,
++	0x0000001d, 0x00004900, 0x00000000, 0x00000000, 0x70460001, 0x00000019, 0x70460001, 0x00000031,
++	0x70268000, 0x488c0101, 0x00000000, 0x408c0001, 0x00f03000, 0x48840001, 0x00f03000, 0x48acc001,
++	0x0000f180, 0x48840502, 0x00000000, 0x017f017f, 0x40840104, 0x00000000, 0x00007f00, 0x00000000,
++	0x00007f00, 0x48b4c085, 0x00510430, 0x00400080, 0x00030000, 0x00000000, 0x00001000, 0x48b4ca83,
++	0x00030000, 0x00000000, 0x00000000, 0x408c1704, 0x00000430, 0x00040000, 0x00000000, 0x00000018,
++	0x488c2083, 0x00040000, 0x00000000, 0x00000000, 0x702c0001, 0x00000003, 0x70460004, 0x0000001d,
++	0x00004900, 0x00000000, 0x00000000, 0x70460004, 0x0000001c, 0x00004900, 0x00000000, 0x00000000,
++	0x70460004, 0x00000004, 0x00004900, 0x00000000, 0x00000000, 0x70268000,
 +};
 +
-+static unsigned
-+g_blit_stream(uint32_t *dw)
-+{
-+	const uint64_t src = 0x30000, dst = 0x40000, border = 0x4800, ts = 0x4900;
-+	const uint32_t sw = 128, sh = 128, dw_ = 384, dh = 384, src_pitch = 512, dst_pitch = 1536;
-+	unsigned n = 0;
-+#define EV(e)	do { dw[n++] = G_PKT7(0x46, 1); dw[n++] = (e); } while (0)
-+#define EV_TS(e) do { dw[n++] = G_PKT7(0x46, 4); dw[n++] = (e); dw[n++] = (uint32_t)ts; dw[n++] = (uint32_t)(ts >> 32); dw[n++] = 0; } while (0)
-+#define REG(r, v) do { dw[n++] = g_pkt4((r), 1); dw[n++] = (v); } while (0)
-+	EV(0x31);	/* CACHE_INVALIDATE */
-+	REG(0xbb08, 0xfffff);
-+	dw[n++] = G_PKT7(0x26, 0);
-+	for (unsigned i = 0; i < sizeof(g_blit_init) / sizeof(g_blit_init[0]); i++)
-+		REG(g_blit_init[i][0], g_blit_init[i][1]);
-+	dw[n++] = g_pkt4(0xb302, 2); dw[n++] = (uint32_t)border; dw[n++] = (uint32_t)(border >> 32);
-+	dw[n++] = g_pkt4(0xb180, 2); dw[n++] = (uint32_t)border; dw[n++] = (uint32_t)(border >> 32);
-+	EV_TS(0x1d);	/* PC_CCU_FLUSH_COLOR_TS */
-+	EV(0x19);	/* PC_CCU_INVALIDATE_COLOR */
-+	EV(0x31);
-+	dw[n++] = G_PKT7(0x26, 0);
-+	REG(0x8c01, 0);
-+	REG(0x8c00, 0x00f03000);
-+	REG(0x8400, 0x00f03000);
-+	REG(0xacc0, 0xf180);
-+	dw[n++] = g_pkt4(0x8405, 2); dw[n++] = 0; dw[n++] = (dw_ - 1) | ((dh - 1) << 16);
-+	dw[n++] = g_pkt4(0x8401, 4); dw[n++] = 0; dw[n++] = (sw - 1) << 8; dw[n++] = 0; dw[n++] = (sh - 1) << 8;
-+	dw[n++] = g_pkt4(0xb4c0, 5);
-+	dw[n++] = 0x00500430u | 0x10000u;
-+	dw[n++] = sw | (sh << 15);
-+	dw[n++] = (uint32_t)src; dw[n++] = (uint32_t)(src >> 32);
-+	dw[n++] = src_pitch << 3;
-+	dw[n++] = g_pkt4(0xb4ca, 3); dw[n++] = (uint32_t)src; dw[n++] = (uint32_t)(src >> 32); dw[n++] = 0;
-+	dw[n++] = g_pkt4(0x8c17, 4); dw[n++] = 0x430; dw[n++] = (uint32_t)dst; dw[n++] = (uint32_t)(dst >> 32); dw[n++] = dst_pitch >> 6;
-+	dw[n++] = g_pkt4(0x8c20, 3); dw[n++] = (uint32_t)dst; dw[n++] = (uint32_t)(dst >> 32); dw[n++] = 0;
-+	dw[n++] = G_PKT7(0x2c, 1); dw[n++] = 3;	/* CP_BLIT, BLIT_OP_SCALE */
-+	EV_TS(0x1d);
-+	EV_TS(0x1c);	/* PC_CCU_FLUSH_DEPTH_TS */
-+	EV_TS(0x04);	/* CACHE_FLUSH_TS */
-+	dw[n++] = G_PKT7(0x26, 0);
-+#undef EV
-+#undef EV_TS
-+#undef REG
-+	return n;
-+}
-+
-+static void
++__attribute__((optnone, noinline)) static void
 +g_blit_test(vm_offset_t mem, uint64_t pa0, volatile uint32_t *ring, uint32_t *wptr)
 +{
 +	volatile uint32_t *src = (volatile uint32_t *)(mem + 0x30000);
 +	volatile uint32_t *dst = (volatile uint32_t *)(mem + 0x40000);
-+	static uint32_t dw[512];
-+	unsigned n = g_blit_stream(dw);
++	const uint32_t *dw = g_blit_dw;
++	const unsigned n = sizeof(g_blit_dw) / sizeof(g_blit_dw[0]);
 +	printf("SWEET GPUB: blit stream %u dwords\n", n);
 +	g_wait(150);
 +	vm_offset_t fb = ml_io_map(0x85200000, 0xc00000);
@@ -4475,7 +4436,7 @@
 +	g_wait(300);
 +}
 +
-+static void
++__attribute__((optnone, noinline)) static void
 +g_cp_test(int blit)
 +{
 +	/* GCC clocks the GPU's memory path needs (Linux: gcc_gpu_cfg_ahb, gcc_gpu_memnoc_gfx, gcc_gpu_snoc_dvm_gfx) */
