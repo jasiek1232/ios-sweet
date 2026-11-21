@@ -32,7 +32,7 @@
  		thread_deallocate(thread);
 --- /dev/null
 +++ b/bsd/dev/sweet_touch_gt9916.c
-@@ -0,0 +1,2212 @@
+@@ -0,0 +1,2229 @@
 +/*
 + * miami (Motorola Edge 30 Neo, SM6375): Goodix GT9916S touch over the GENI SPI engine.
 + *
@@ -1999,20 +1999,37 @@
 +static int
 +g_smc5(uint64_t fn, uint64_t arginfo, uint64_t x2, uint64_t x3, uint64_t x4, uint64_t *val)
 +{
-+	register uint64_t r0 __asm__("x0") = fn;
-+	register uint64_t r1 __asm__("x1") = arginfo;
-+	register uint64_t r2 __asm__("x2") = x2;
-+	register uint64_t r3 __asm__("x3") = x3;
-+	register uint64_t r4 __asm__("x4") = x4;
-+	register uint64_t r5 __asm__("x5") = 0;
-+	register uint64_t r6 __asm__("x6") = 0;
-+	__asm__ volatile ("smc #0"
-+	    : "+r"(r0), "+r"(r1), "+r"(r2), "+r"(r3), "+r"(r4), "+r"(r5), "+r"(r6)
-+	    :
-+	    : "x7", "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15", "x16", "x17", "memory");
++	/*
++	 * Same loop as Linux (__scm_smc_do_quirk): when TZ answers 1 (QCOM_SCM_INTERRUPTED) it wants
++	 * the call re-issued with x0 = 1, the other arguments unchanged and x6 carrying back the value it returned.
++	 */
++	uint64_t a0 = fn, st6 = 0, rv1 = 0;
++	unsigned tries = 0;
++	int rc;
++	do {
++		register uint64_t r0 __asm__("x0") = a0;
++		register uint64_t r1 __asm__("x1") = arginfo;
++		register uint64_t r2 __asm__("x2") = x2;
++		register uint64_t r3 __asm__("x3") = x3;
++		register uint64_t r4 __asm__("x4") = x4;
++		register uint64_t r5 __asm__("x5") = 0;
++		register uint64_t r6 __asm__("x6") = st6;
++		__asm__ volatile ("smc #0"
++		    : "+r"(r0), "+r"(r1), "+r"(r2), "+r"(r3), "+r"(r4), "+r"(r5), "+r"(r6)
++		    :
++		    : "x7", "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15", "x16", "x17", "memory");
++		rc = (int)(uint32_t)r0;
++		rv1 = r1;
++		st6 = r6;
++		if (r0 == 1)
++			a0 = 1;
++		tries++;
++	} while (rc == 1 && tries < 100000);
++	if (tries > 1)
++		printf("SWEET GPUF: TZ interrupted the call %u time(s)\n", tries - 1);
 +	if (val)
-+		*val = r1;
-+	return (int)(uint32_t)r0;
++		*val = rv1;
++	return rc;
 +}
 +
 +static void
