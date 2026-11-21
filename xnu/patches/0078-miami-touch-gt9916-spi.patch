@@ -32,7 +32,7 @@
  		thread_deallocate(thread);
 --- /dev/null
 +++ b/bsd/dev/sweet_touch_gt9916.c
-@@ -0,0 +1,1516 @@
+@@ -0,0 +1,1562 @@
 +/*
 + * miami (Motorola Edge 30 Neo, SM6375): Goodix GT9916S touch over the GENI SPI engine.
 + *
@@ -1384,6 +1384,48 @@
 +	g_wait(300);
 +}
 +
++/*
++ * stage 13: sort out what the stage 12 answers mean. Read-only SMCs again:
++ *  - PAS_IS_SUPPORTED for every pas id 0..31 (known-good ids such as modem/adsp tell us how a
++ *    "supported" answer looks, so we can read the one for id 13 (GPU zap) correctly)
++ *  - a deliberately bogus SIP function, to see what "unknown function" looks like
++ *  - the INFO_IS_CALL_AVAIL probe in the 32-bit and 64-bit conventions, Linux's convention probe
++ */
++static void
++g_scm_probe2(void)
++{
++	uint64_t a[4];
++	printf("SWEET GPUZ2: bogus SIP fn 0x4200027e ...\n");
++	g_wait(300);
++	a[0] = 0x4200027eull; a[1] = 0; a[2] = 0; a[3] = 0;
++	g_smc(a);
++	printf("SWEET GPUZ2: bogus -> ret 0x%llx val 0x%llx\n", (unsigned long long)a[0], (unsigned long long)a[1]);
++	g_wait(300);
++	for (unsigned id = 0; id < 32; id++) {
++		uint64_t b[4] = { G_SCM_FN(0x02, 0x07), 1, id, 0 };
++		g_smc(b);
++		printf("SWEET GPUZ2: PAS_IS_SUPPORTED(%u) ret 0x%llx val 0x%llx\n", id, (unsigned long long)b[0], (unsigned long long)b[1]);
++		if ((id & 7) == 7)
++			g_wait(300);
++	}
++	{
++		uint64_t c[4] = { 0x02000101ull, 1, 0x02000107ull, 0 };
++		printf("SWEET GPUZ2: INFO_IS_CALL_AVAIL smc32 ...\n");
++		g_wait(300);
++		g_smc(c);
++		printf("SWEET GPUZ2: smc32 info -> ret 0x%llx val 0x%llx\n", (unsigned long long)c[0], (unsigned long long)c[1]);
++		g_wait(300);
++	}
++	{
++		uint64_t d[4] = { G_SCM_FN(0x01, 0x01), 1, G_SCM_FN(0x01, 0x01), 0 };
++		printf("SWEET GPUZ2: INFO_IS_CALL_AVAIL(self) smc64 ...\n");
++		g_wait(300);
++		g_smc(d);
++		printf("SWEET GPUZ2: smc64 info(self) -> ret 0x%llx val 0x%llx\n", (unsigned long long)d[0], (unsigned long long)d[1]);
++		g_wait(300);
++	}
++}
++
 +static void
 +g_gpuspmi_thread(void *arg, wait_result_t w)
 +{
@@ -1418,6 +1460,10 @@
 +	}
 +	if (stage == 12) {
 +		g_scm_probe();
++		goto out;
++	}
++	if (stage == 13) {
++		g_scm_probe2();
 +		goto out;
 +	}
 +	if (stage >= 6 && stage < 10) {
