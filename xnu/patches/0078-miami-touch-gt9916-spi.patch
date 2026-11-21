@@ -32,7 +32,7 @@
  		thread_deallocate(thread);
 --- /dev/null
 +++ b/bsd/dev/sweet_touch_gt9916.c
-@@ -0,0 +1,1463 @@
+@@ -0,0 +1,1516 @@
 +/*
 + * miami (Motorola Edge 30 Neo, SM6375): Goodix GT9916S touch over the GENI SPI engine.
 + *
@@ -1335,6 +1335,55 @@
 +	g_wait(500);
 +}
 +
++/*
++ * stage 12: ask TrustZone (Qualcomm SCM over SMCCC, std call, SMC64, SIP owner) which of the
++ * PIL calls the zap shader load needs exist. Read-only: QCOM_SCM_INFO_IS_CALL_AVAIL for each
++ * call, and PAS_IS_SUPPORTED for the GPU zap (pas id 13). No image is passed to TZ.
++ */
++static void
++g_smc(uint64_t a[4])
++{
++	register uint64_t x0 __asm__("x0") = a[0];
++	register uint64_t x1 __asm__("x1") = a[1];
++	register uint64_t x2 __asm__("x2") = a[2];
++	register uint64_t x3 __asm__("x3") = a[3];
++	register uint64_t x4 __asm__("x4") = 0;
++	register uint64_t x5 __asm__("x5") = 0;
++	register uint64_t x6 __asm__("x6") = 0;
++	__asm__ volatile ("smc #0"
++	    : "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x3), "+r"(x4), "+r"(x5), "+r"(x6)
++	    :
++	    : "x7", "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15", "x16", "x17", "memory");
++	a[0] = x0; a[1] = x1; a[2] = x2; a[3] = x3;
++}
++
++#define G_SCM_FN(svc, cmd) (0x40000000ull | (2ull << 24) | (((uint64_t)(svc) & 0xffu) << 8) | ((cmd) & 0xffu))
++
++static void
++g_scm_probe(void)
++{
++	static const struct { uint8_t svc, cmd; const char *name; } q[] = {
++		{ 0x02, 0x07, "PIL_PAS_IS_SUPPORTED" }, { 0x02, 0x01, "PIL_PAS_INIT_IMAGE" },
++		{ 0x02, 0x02, "PIL_PAS_MEM_SETUP" }, { 0x02, 0x05, "PIL_PAS_AUTH_AND_RESET" },
++		{ 0x02, 0x06, "PIL_PAS_SHUTDOWN" }, { 0x01, 0x01, "INFO_IS_CALL_AVAIL" },
++	};
++	for (unsigned i = 0; i < sizeof(q) / sizeof(q[0]); i++) {
++		uint64_t a[4] = { G_SCM_FN(0x01, 0x01), 1, G_SCM_FN(q[i].svc, q[i].cmd), 0 };
++		printf("SWEET GPUZ: IS_CALL_AVAIL(%s fn 0x%llx) ...\n", q[i].name, (unsigned long long)a[2]);
++		g_wait(300);
++		g_smc(a);
++		printf("SWEET GPUZ: %s -> ret 0x%llx val 0x%llx (%s)\n", q[i].name, (unsigned long long)a[0],
++		    (unsigned long long)a[1], (a[0] == 0 && a[1] != 0) ? "AVAILABLE" : "not available / error");
++		g_wait(300);
++	}
++	uint64_t b[4] = { G_SCM_FN(0x02, 0x07), 1, 13, 0 };
++	printf("SWEET GPUZ: PAS_IS_SUPPORTED(13) ...\n");
++	g_wait(300);
++	g_smc(b);
++	printf("SWEET GPUZ: PAS_IS_SUPPORTED(13) -> ret 0x%llx val 0x%llx\n", (unsigned long long)b[0], (unsigned long long)b[1]);
++	g_wait(300);
++}
++
 +static void
 +g_gpuspmi_thread(void *arg, wait_result_t w)
 +{
@@ -1365,6 +1414,10 @@
 +	}
 +	if (stage == 11) {
 +		g_smmu_setup_test();
++		goto out;
++	}
++	if (stage == 12) {
++		g_scm_probe();
 +		goto out;
 +	}
 +	if (stage >= 6 && stage < 10) {
