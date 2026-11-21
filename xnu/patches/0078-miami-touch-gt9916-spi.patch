@@ -32,7 +32,7 @@
  		thread_deallocate(thread);
 --- /dev/null
 +++ b/bsd/dev/sweet_touch_gt9916.c
-@@ -0,0 +1,1115 @@
+@@ -0,0 +1,1151 @@
 +/*
 + * miami (Motorola Edge 30 Neo, SM6375): Goodix GT9916S touch over the GENI SPI engine.
 + *
@@ -949,14 +949,14 @@
 +	(void)*(volatile uint32_t *)va;
 +}
 +
-+static void
++static int
 +g_gx_sequence(void)
 +{
 +	vm_offset_t cc = g_gpu_map(0x05991000ULL) - 0;
 +	vm_offset_t cc8 = g_gpu_map(0x05998000ULL);
 +	if (!cc || !cc8) {
 +		printf("SWEET GPUX: map failed\n");
-+		return;
++		return 0;
 +	}
 +	volatile uint32_t *gdscr = (volatile uint32_t *)(cc + 0x00c);
 +	volatile uint32_t *cfg = (volatile uint32_t *)(cc + 0x010);
@@ -1002,6 +1002,39 @@
 +	g_wait(1500);
 +	printf("SWEET GPUX: later GDSCR 0x%08x CFG 0x%08x\n", *gdscr, *cfg);
 +	g_wait(500);
++	return (*gdscr & 0x80000000u) != 0;
++}
++
++/* stage 7: GX is on; look at the GPUCC clock gates (read-only) then at the GPU core */
++static void
++g_gpu_core_probe(void)
++{
++	static const struct { uint64_t pa; const char *name; } cbcr[] = {
++		{ 0x05991078ULL, "AHB_CBCR" }, { 0x059910a4ULL, "CX_GFX3D" }, { 0x059910a8ULL, "CX_GFX3D_SLV" },
++		{ 0x05991098ULL, "CX_GMU" }, { 0x0599108cULL, "CX_SNOC_DVM" }, { 0x05991004ULL, "CXO_AON" },
++		{ 0x0599109cULL, "CXO" }, { 0x05991060ULL, "GX_CXO" }, { 0x05991054ULL, "GX_GFX3D" },
++		{ 0x0599101cULL, "GX_GFX3D_CLK_SRC cmd" },
++	};
++	for (unsigned i = 0; i < sizeof(cbcr) / sizeof(cbcr[0]); i++) {
++		vm_offset_t va = g_gpu_map(cbcr[i].pa);
++		printf("SWEET GPUC: reading %s PA 0x%llx ...\n", cbcr[i].name, (unsigned long long)cbcr[i].pa);
++		g_wait(200);
++		uint32_t v = va ? *(volatile uint32_t *)va : 0xdeadbeef;
++		printf("SWEET GPUC: %s = 0x%08x\n", cbcr[i].name, v);
++		g_wait(200);
++	}
++	static const struct { uint64_t pa; const char *name; } core[] = {
++		{ 0x05900840ULL, "RBBM_STATUS" }, { 0x05900804ULL, "RBBM_INT_0_STATUS" },
++	};
++	for (unsigned i = 0; i < sizeof(core) / sizeof(core[0]); i++) {
++		vm_offset_t va = g_gpu_map(core[i].pa);
++		printf("SWEET GPUC: reading GPU %s PA 0x%llx ...\n", core[i].name, (unsigned long long)core[i].pa);
++		g_wait(1500);
++		uint32_t v = va ? *(volatile uint32_t *)va : 0xdeadbeef;
++		__asm__ volatile ("dmb oshld" ::: "memory");
++		printf("SWEET GPUC: GPU %s = 0x%08x\n", core[i].name, v);
++		g_wait(1500);
++	}
 +}
 +
 +static void
@@ -1028,8 +1061,11 @@
 +		printf("SWEET GPUS: %s = 0x%08x\n", regs[i].name, v);
 +		g_wait(1500);
 +	}
-+	if (stage == 6) {
-+		g_gx_sequence();
++	if (stage == 6 || stage == 7) {
++		int on = g_gx_sequence();
++		if (stage == 7 && on) {
++			g_gpu_core_probe();
++		}
 +		goto out;
 +	}
 +	if (stage == 5) {
