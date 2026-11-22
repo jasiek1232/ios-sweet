@@ -9,7 +9,7 @@
  bsd/dev/sweet_usb.c			standard
 --- /dev/null
 +++ b/bsd/dev/sweet_gpu_a619.c
-@@ -0,0 +1,3731 @@
+@@ -0,0 +1,3891 @@
 +/*
 + * miami (Motorola Edge 30 Neo, SM6375): Adreno 619 (GMU-wrapper "holi", chipid 0x6010901) bring-up.
 + *
@@ -1053,7 +1053,7 @@
 + * allocations mapped at an IOVA: dynamic IOVAs come from a bump allocator starting at G_IOVA_ARENA, fixed
 + * IOVAs are for the A2D blit demo whose command stream has its addresses baked in. Nothing is ever freed yet.
 + */
-+#define G_PT_PAGES	64u		/* 4 KiB table pages in the pool (256 KiB) */
++#define G_PT_PAGES	512u		/* 4 KiB table pages in the pool (2 MiB) */
 +#define G_IOVA_ARENA	0x00100000ull	/* dynamic allocations start here; below is the fixed demo layout */
 +#define G_IOVA_END	0x04000000ull	/* the panel framebuffer blocks live at this IOVA */
 +#define G_PTE_PAGE_WB	0x743ull	/* valid page, attr0 (write-back), inner shareable, AF */
@@ -1148,7 +1148,7 @@
 +static void
 +g_as_sync(void)
 +{
-+	flush_dcache64((addr64_t)gp.pt_pa, G_PT_PAGES * 0x1000u, TRUE);
++	flush_dcache64((addr64_t)gp.pt_pa, ((gp.pt_used * 0x1000u) + PAGE_MASK) & ~(unsigned)PAGE_MASK, TRUE);
 +	__asm__ volatile ("dsb sy" ::: "memory");
 +}
 +
@@ -3446,6 +3446,164 @@
 +	return -1;
 +}
 +
++/* ---- buffers and submissions for the IOKit user client (iokit/Kernel/arm/SweetGPUService.cpp) ---- */
++
++/*
++ * Client address space: from G_USER_A_BASE up to the highest address the boot-time probes (g_user_probes) got the
++ * GPU to translate. The arena starts empty, so user mapping is disabled until a probe passed.
++ */
++#define G_USER_A_BASE	0x010000000ull	/* 256 MiB: first-level index 0, like all kernel mappings */
++#define G_USER_VA_ALIGN	0x10000ull
++
++static uint64_t g_user_next = G_USER_A_BASE;
++static uint64_t g_user_end;	/* 0 until a probe passed */
++
++bool sweet_gpu_ready(void);
++int sweet_gpu_map_user(uint64_t *iova_out, const uint64_t *pages, uint32_t npages, uint32_t page_size);
++int sweet_gpu_submit_user(uint64_t ib_iova, uint32_t dwords, uint32_t timeout_ms, uint32_t *fence_out);
++
++bool
++sweet_gpu_ready(void)
++{
++	return svc.ready != 0;
++}
++
++/* invalidate the context bank's TLB (TLBIALL, then TLBSYNC and poll TLBSTATUS.GSACTIVE) */
++static void
++g_tlb_flush(void)
++{
++	vm_offset_t cb = g_gpu_map(0x05948000ull);
++	if (!cb)
++		return;
++	*(volatile uint32_t *)(cb + 0x618) = 0;
++	__asm__ volatile ("dsb sy" ::: "memory");
++	*(volatile uint32_t *)(cb + 0x7f0) = 0;
++	__asm__ volatile ("dsb sy" ::: "memory");
++	for (int i = 0; i < 10000; i++)
++		if (!(*(volatile uint32_t *)(cb + 0x7f4) & 1u))
++			break;
++}
++
++/*
++ * Map physical pages at a fresh GPU address. The VA is never reused yet: freed buffers leak their VA and
++ * their table pages. The caller has already cleaned the CPU caches (the GPU does not snoop).
++ */
++int
++sweet_gpu_map_user(uint64_t *iova_out, const uint64_t *pages, uint32_t npages, uint32_t page_size)
++{
++	if (!svc.ready || npages == 0 || (page_size & 0xfffu))
++		return -1;
++	uint64_t size = (uint64_t)npages * page_size;
++	lck_mtx_lock(&g_svc_lock);
++	uint64_t iova = g_user_next;
++	if (iova + size > g_user_end) {
++		lck_mtx_unlock(&g_svc_lock);
++		return -1;
++	}
++	for (uint32_t i = 0; i < npages; i++) {
++		if (!g_as_map(iova + (uint64_t)i * page_size, pages[i], page_size, G_PTE_PAGE_WB)) {
++			lck_mtx_unlock(&g_svc_lock);
++			return -1;
++		}
++	}
++	g_user_next = (iova + size + G_USER_VA_ALIGN - 1) & ~(G_USER_VA_ALIGN - 1);
++	g_as_sync();
++	g_tlb_flush();
++	lck_mtx_unlock(&g_svc_lock);
++	*iova_out = iova;
++	return 0;
++}
++
++/* Run an indirect buffer (user GPU memory) and wait for it: 0, or -1 on a hang or fault (the fault is cleared). */
++int
++sweet_gpu_submit_user(uint64_t ib_iova, uint32_t dwords, uint32_t timeout_ms, uint32_t *fence_out)
++{
++	const uint32_t pkt[4] = { G_PKT7(0x3f, 3), (uint32_t)ib_iova, (uint32_t)(ib_iova >> 32), dwords };
++	uint32_t seq = 0;
++	*fence_out = 0;
++	if (sweet_gpu_submit(pkt, 4, &seq) != 0)
++		return -1;
++	int rc = sweet_gpu_wait(seq, timeout_ms ? timeout_ms : 1000);
++	*fence_out = seq;
++	if (rc) {
++		vm_offset_t cb = g_gpu_map(0x05948000ull);
++		if (cb) {
++			uint32_t fsr = *(volatile uint32_t *)(cb + 0x58);
++			uint64_t far = *(volatile uint32_t *)(cb + 0x60) | ((uint64_t)*(volatile uint32_t *)(cb + 0x64) << 32);
++			uint32_t syn = *(volatile uint32_t *)(cb + 0x68);
++			printf("SWEET GPUQ: user IB %llx (%u dwords) timed out: smmu fsr 0x%x far 0x%llx fsynr0 0x%x\n",
++			    (unsigned long long)ib_iova, dwords, fsr, (unsigned long long)far, syn);
++			*(volatile uint32_t *)(cb + 0x58) = fsr;	/* a fault stops the GPU's writes until FSR is cleared */
++			__asm__ volatile ("dsb sy" ::: "memory");
++		}
++	}
++	return rc;
++}
++
++/* one probe: map two pages at iova, run an indirect buffer there that writes a word into the second page */
++static int
++g_user_probe(uint64_t iova, vm_offset_t um, uint64_t upa, uint32_t magic)
++{
++	volatile uint32_t *ib = (volatile uint32_t *)um;
++	const uint64_t target = iova + PAGE_SIZE + 0x10;
++	uint32_t fence = 0;
++	for (unsigned i = 0; i < 2; i++)
++		if (!g_as_map(iova + (uint64_t)i * PAGE_SIZE, upa + (uint64_t)i * PAGE_SIZE, PAGE_SIZE, G_PTE_PAGE_WB)) {
++			printf("SWEET GPUQ: probe at IOVA 0x%llx: out of table pages\n", (unsigned long long)iova);
++			return 0;
++		}
++	g_as_sync();
++	g_tlb_flush();
++	{
++		volatile uint64_t *l1 = (volatile uint64_t *)gp.pt_kva;
++		uint64_t e1 = l1[(iova >> 30) & 0x1ff];
++		volatile uint64_t *l2 = (volatile uint64_t *)(gp.pt_kva + (vm_offset_t)((e1 & 0x0000fffffffff000ull) - gp.pt_pa));
++		uint64_t e2 = l2[(iova >> 21) & 0x1ff];
++		volatile uint64_t *l3 = (volatile uint64_t *)(gp.pt_kva + (vm_offset_t)((e2 & 0x0000fffffffff000ull) - gp.pt_pa));
++		printf("SWEET GPUQ: probe at IOVA 0x%llx: L1[%u]=0x%llx L2[%u]=0x%llx L3[%u]=0x%llx\n", (unsigned long long)iova,
++		    (unsigned)((iova >> 30) & 0x1ff), (unsigned long long)e1, (unsigned)((iova >> 21) & 0x1ff),
++		    (unsigned long long)e2, (unsigned)((iova >> 12) & 0x1ff), (unsigned long long)l3[(iova >> 12) & 0x1ff]);
++	}
++	ib[0] = G_PKT7(0x3d, 3);
++	ib[1] = (uint32_t)target;
++	ib[2] = (uint32_t)(target >> 32);
++	ib[3] = magic;
++	*(volatile uint32_t *)(um + PAGE_SIZE + 0x10) = 0;
++	flush_dcache64((addr64_t)upa, 2 * PAGE_SIZE, TRUE);
++	int sr = sweet_gpu_submit_user(iova, 4, 500, &fence);
++	flush_dcache64((addr64_t)upa, 2 * PAGE_SIZE, TRUE);
++	uint32_t v = *(volatile uint32_t *)(um + PAGE_SIZE + 0x10);
++	int ok = (sr == 0 && v == magic);
++	printf("SWEET GPUQ: user IB probe at IOVA 0x%llx: submit %s, word 0x%08x -> %s\n", (unsigned long long)iova,
++	    sr == 0 ? "ok" : "FAILED", v, ok ? "WORKS" : "not written");
++	return ok;
++}
++
++/*
++ * Find out how far up the GPU translates, probing from low to high and stopping at the first miss (a fault
++ * wedges the CP, so this runs after the demo). The arena then spans from G_USER_A_BASE to the last pass.
++ */
++static void
++g_user_probes(void)
++{
++	static const uint64_t cand[] = { 0x3ff00000ull, 0xfff00000ull, 0x200000000ull, 0x7eff000000ull };
++	vm_offset_t um = 0;
++	if (kmem_alloc_contig(kernel_map, &um, 2 * PAGE_SIZE, PAGE_MASK, 0, 0,
++	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS)
++		return;
++	uint64_t upa = ptoa_64(pmap_find_phys(kernel_pmap, (addr64_t)um));
++	for (unsigned i = 0; i < sizeof(cand) / sizeof(cand[0]); i++) {
++		if (!g_user_probe(cand[i], um, upa, 0xfeed0001u + i))
++			break;
++		g_user_end = cand[i];
++	}
++	if (g_user_end)
++		printf("SWEET GPUQ: client arena 0x%llx-0x%llx\n", (unsigned long long)g_user_next,
++		    (unsigned long long)g_user_end);
++	else
++		printf("SWEET GPUQ: client mappings stay disabled\n");
++}
++
 +/*
 + * stage 17: a real graphics operation. The A6xx 2D engine (CP_BLIT, op SCALE) scales a 128x128 gradient
 + * texture to 384x384 with bilinear filtering into a pitch-aligned GPU buffer, the same stream Mesa's turnip
@@ -3625,7 +3783,8 @@
 +	g_smmu_wr("CBAR0", base + 0x1000, (1u << 16) | (0xfu << 12) | (3u << 8));
 +	g_smmu_wr("CB0 TTBR0 lo", cb + 0x20, (uint32_t)gp.pt_pa);
 +	g_smmu_wr("CB0 TTBR0 hi", cb + 0x24, (uint32_t)((gp.pt_pa >> 32) | (1u << 16)));
-+	g_smmu_wr("CB0 TCR2", cb + 0x10, 0x2u);
++	/* PASIZE 2 (40-bit PA), SEP 7 = sign extension at the upstream address size (SEP 0 only accepts VAs below 2 GiB) */
++	g_smmu_wr("CB0 TCR2", cb + 0x10, 0x2u | (7u << 15));
 +	g_smmu_wr("CB0 TCR", cb + 0x30, 0x80803519u);
 +	g_smmu_wr("CB0 MAIR0", cb + 0x38, 0x000044ffu);   /* attr 0 write-back, attr 1 non-cacheable */
 +	g_smmu_wr("CB0 MAIR1", cb + 0x3c, 0x0u);
@@ -3692,6 +3851,7 @@
 +	}
 +	if (blit)
 +		g_blit_test();
++	g_user_probes();
 +}
 +
 +static void
