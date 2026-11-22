@@ -32,7 +32,7 @@
  		thread_deallocate(thread);
 --- /dev/null
 +++ b/bsd/dev/sweet_touch_gt9916.c
-@@ -0,0 +1,4721 @@
+@@ -0,0 +1,4730 @@
 +/*
 + * miami (Motorola Edge 30 Neo, SM6375): Goodix GT9916S touch over the GENI SPI engine.
 + *
@@ -4392,7 +4392,15 @@
 +	const unsigned n = sizeof(g_blit_dw) / sizeof(g_blit_dw[0]);
 +	printf("SWEET GPUB: blit stream %u dwords\n", n);
 +	g_wait(150);
-+	vm_offset_t fb = ml_io_map(0x85200000, 0xc00000);
++	/* ml_io_map() panics when it cannot get the address space (a single 12 MiB mapping did), so map only the
++	 * 384 panel rows we draw into, in twelve small pieces of 32 rows (stride 4320 bytes, 4 bytes per pixel) */
++	vm_offset_t fbg[12];
++	printf("SWEET GPUB: mapping the panel rows ...\n");
++	g_wait(300);
++	for (unsigned g = 0; g < 12; g++)
++		fbg[g] = ml_io_map(0x85200000ull + (uint64_t)(800 + g * 32) * 4320 + 348 * 4, 32 * 4320);
++	printf("SWEET GPUB: panel rows mapped\n");
++	g_wait(300);
 +	vm_offset_t st_va = g_gpu_map(G_CP_BASE + 0x210 * 4);
 +	for (unsigned frame = 0; frame < 300; frame++) {
 +		uint32_t blue = (frame * 6) & 0xffu;
@@ -4426,10 +4434,11 @@
 +			if (untouched == 384u * 384u)
 +				return;
 +		}
-+		volatile uint32_t *f = (volatile uint32_t *)fb;
-+		for (unsigned y = 0; y < 384; y++)
++		for (unsigned y = 0; y < 384; y++) {
++			volatile uint32_t *f = (volatile uint32_t *)(fbg[y / 32] + (y % 32) * 4320);
 +			for (unsigned x = 0; x < 384; x++)
-+				f[(800 + y) * 1080 + 348 + x] = dst[y * 384 + x];
++				f[x] = dst[y * 384 + x];
++		}
 +		g_wait(100);
 +	}
 +	printf("SWEET GPUB: 300 frames drawn\n");
