@@ -9,7 +9,7 @@
  bsd/dev/sweet_usb.c			standard
 --- /dev/null
 +++ b/bsd/dev/sweet_gpu_a619.c
-@@ -0,0 +1,3852 @@
+@@ -0,0 +1,3890 @@
 +/*
 + * miami (Motorola Edge 30 Neo, SM6375): Adreno 619 (GMU-wrapper "holi", chipid 0x6010901) bring-up.
 + *
@@ -3448,11 +3448,15 @@
 +
 +/* ---- buffers and submissions for the IOKit user client (iokit/Kernel/arm/SweetGPUService.cpp) ---- */
 +
-+#define G_USER_VA_BASE	0x200000000ull	/* above everything the kernel itself maps */
-+#define G_USER_VA_END	0x7f00000000ull
++/*
++ * Client address space: from G_USER_A_BASE up to the highest address the boot-time probes (g_user_probes) got the
++ * GPU to translate. The arena starts empty, so user mapping is disabled until a probe passed.
++ */
++#define G_USER_A_BASE	0x010000000ull	/* 256 MiB: first-level index 0, like all kernel mappings */
 +#define G_USER_VA_ALIGN	0x10000ull
 +
-+static uint64_t g_user_next = G_USER_VA_BASE;
++static uint64_t g_user_next = G_USER_A_BASE;
++static uint64_t g_user_end;	/* 0 until a probe passed */
 +
 +bool sweet_gpu_ready(void);
 +int sweet_gpu_map_user(uint64_t *iova_out, const uint64_t *pages, uint32_t npages, uint32_t page_size);
@@ -3492,7 +3496,7 @@
 +	uint64_t size = (uint64_t)npages * page_size;
 +	lck_mtx_lock(&g_svc_lock);
 +	uint64_t iova = g_user_next;
-+	if (iova + size > G_USER_VA_END) {
++	if (iova + size > g_user_end) {
 +		lck_mtx_unlock(&g_svc_lock);
 +		return -1;
 +	}
@@ -3534,6 +3538,70 @@
 +		}
 +	}
 +	return rc;
++}
++
++/* one probe: map two pages at iova, run an indirect buffer there that writes a word into the second page */
++static int
++g_user_probe(uint64_t iova, vm_offset_t um, uint64_t upa, uint32_t magic)
++{
++	volatile uint32_t *ib = (volatile uint32_t *)um;
++	const uint64_t target = iova + PAGE_SIZE + 0x10;
++	uint32_t fence = 0;
++	for (unsigned i = 0; i < 2; i++)
++		if (!g_as_map(iova + (uint64_t)i * PAGE_SIZE, upa + (uint64_t)i * PAGE_SIZE, PAGE_SIZE, G_PTE_PAGE_WB)) {
++			printf("SWEET GPUQ: probe at IOVA 0x%llx: out of table pages\n", (unsigned long long)iova);
++			return 0;
++		}
++	g_as_sync();
++	g_tlb_flush();
++	{
++		volatile uint64_t *l1 = (volatile uint64_t *)gp.pt_kva;
++		uint64_t e1 = l1[(iova >> 30) & 0x1ff];
++		volatile uint64_t *l2 = (volatile uint64_t *)(gp.pt_kva + (vm_offset_t)((e1 & 0x0000fffffffff000ull) - gp.pt_pa));
++		uint64_t e2 = l2[(iova >> 21) & 0x1ff];
++		volatile uint64_t *l3 = (volatile uint64_t *)(gp.pt_kva + (vm_offset_t)((e2 & 0x0000fffffffff000ull) - gp.pt_pa));
++		printf("SWEET GPUQ: probe at IOVA 0x%llx: L1[%u]=0x%llx L2[%u]=0x%llx L3[%u]=0x%llx\n", (unsigned long long)iova,
++		    (unsigned)((iova >> 30) & 0x1ff), (unsigned long long)e1, (unsigned)((iova >> 21) & 0x1ff),
++		    (unsigned long long)e2, (unsigned)((iova >> 12) & 0x1ff), (unsigned long long)l3[(iova >> 12) & 0x1ff]);
++	}
++	ib[0] = G_PKT7(0x3d, 3);
++	ib[1] = (uint32_t)target;
++	ib[2] = (uint32_t)(target >> 32);
++	ib[3] = magic;
++	*(volatile uint32_t *)(um + PAGE_SIZE + 0x10) = 0;
++	flush_dcache64((addr64_t)upa, 2 * PAGE_SIZE, TRUE);
++	int sr = sweet_gpu_submit_user(iova, 4, 500, &fence);
++	flush_dcache64((addr64_t)upa, 2 * PAGE_SIZE, TRUE);
++	uint32_t v = *(volatile uint32_t *)(um + PAGE_SIZE + 0x10);
++	int ok = (sr == 0 && v == magic);
++	printf("SWEET GPUQ: user IB probe at IOVA 0x%llx: submit %s, word 0x%08x -> %s\n", (unsigned long long)iova,
++	    sr == 0 ? "ok" : "FAILED", v, ok ? "WORKS" : "not written");
++	return ok;
++}
++
++/*
++ * Find out how far up the GPU translates, probing from low to high and stopping at the first miss (a fault
++ * wedges the CP, so this runs after the demo). The arena then spans from G_USER_A_BASE to the last pass.
++ */
++static void
++g_user_probes(void)
++{
++	static const uint64_t cand[] = { 0x3ff00000ull, 0xfff00000ull, 0x200000000ull, 0x7eff000000ull };
++	vm_offset_t um = 0;
++	if (kmem_alloc_contig(kernel_map, &um, 2 * PAGE_SIZE, PAGE_MASK, 0, 0,
++	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS)
++		return;
++	uint64_t upa = ptoa_64(pmap_find_phys(kernel_pmap, (addr64_t)um));
++	for (unsigned i = 0; i < sizeof(cand) / sizeof(cand[0]); i++) {
++		if (!g_user_probe(cand[i], um, upa, 0xfeed0001u + i))
++			break;
++		g_user_end = cand[i];
++	}
++	if (g_user_end)
++		printf("SWEET GPUQ: client arena 0x%llx-0x%llx\n", (unsigned long long)g_user_next,
++		    (unsigned long long)g_user_end);
++	else
++		printf("SWEET GPUQ: client mappings stay disabled\n");
 +}
 +
 +/*
@@ -3780,39 +3848,9 @@
 +		printf("SWEET GPUQ: %u submissions queued, wait %s, %u of %u results correct, last seq %u\n", queued,
 +		    wr == 0 ? "ok" : "TIMED OUT", ok, queued, seq);
 +	}
-+	{
-+		/* the same path the IOKit user client takes: map pages above 4 GiB, run an indirect buffer that writes into them */
-+		vm_offset_t um = 0;
-+		uint64_t uiova = 0, upages[2];
-+		uint32_t fence = 0;
-+		unsigned okc = 0;
-+		if (kmem_alloc_contig(kernel_map, &um, 2 * PAGE_SIZE, PAGE_MASK, 0, 0,
-+		    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) == KERN_SUCCESS) {
-+			uint64_t upa = ptoa_64(pmap_find_phys(kernel_pmap, (addr64_t)um));
-+			upages[0] = upa;
-+			upages[1] = upa + PAGE_SIZE;
-+			int mr = sweet_gpu_map_user(&uiova, upages, 2, PAGE_SIZE);
-+			if (mr == 0) {
-+				const uint64_t target = uiova + PAGE_SIZE + 0x10;
-+				volatile uint32_t *ib = (volatile uint32_t *)um;
-+				ib[0] = G_PKT7(0x3d, 3);
-+				ib[1] = (uint32_t)target;
-+				ib[2] = (uint32_t)(target >> 32);
-+				ib[3] = 0xfeedf00du;
-+				flush_dcache64((addr64_t)upa, 2 * PAGE_SIZE, TRUE);
-+				int sr = sweet_gpu_submit_user(uiova, 4, 500, &fence);
-+				flush_dcache64((addr64_t)upa, 2 * PAGE_SIZE, TRUE);
-+				uint32_t v = *(volatile uint32_t *)(um + PAGE_SIZE + 0x10);
-+				okc = (sr == 0 && v == 0xfeedf00du);
-+				printf("SWEET GPUQ: user IB test: map at IOVA 0x%llx, submit %s, word 0x%08x -> %s\n",
-+				    (unsigned long long)uiova, sr == 0 ? "ok" : "FAILED", v, okc ? "USER PATH WORKS" : "not written");
-+			} else {
-+				printf("SWEET GPUQ: user IB test: map failed\n");
-+			}
-+		}
-+	}
 +	if (blit)
 +		g_blit_test();
++	g_user_probes();
 +}
 +
 +static void
