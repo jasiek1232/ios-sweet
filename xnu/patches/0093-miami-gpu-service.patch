@@ -24,7 +24,7 @@
      "     'IOClass'         = IOPanicPlatform;"
 --- /dev/null
 +++ b/iokit/Kernel/arm/SweetGPUService.cpp
-@@ -0,0 +1,413 @@
+@@ -0,0 +1,423 @@
 +/*
 + * The Adreno 619 as an IOKit service. Boot-arg sweetgpu=1/2 brings the GPU up (bsd/dev/sweet_gpu_a619.c);
 + * with it SweetGPUService is published, and a userland process can open a user client on it
@@ -357,16 +357,26 @@
 +extern "C" void
 +sweet_gpu_service_selftest(void)
 +{
-+	IOUserClient *client = NULL;
 +	if (gSweetGPUService == NULL) {
 +		IOLog("SWEET GPUT: service not published, no selftest\n");
 +		return;
 +	}
-+	IOReturn r = gSweetGPUService->newUserClient(kernel_task, NULL, 0, &client);
-+	if (r != kIOReturnSuccess || client == NULL) {
-+		IOLog("SWEET GPUT: newUserClient failed 0x%x\n", r);
++	/*
++	 * IOService::newUserClient() is unsupported here (a real open goes through IOServiceOpen, which then
++	 * instantiates the class named by kIOUserClientClassKey), so build the client the same way by hand.
++	 */
++	SweetGPUUserClient *client = OSTypeAlloc(SweetGPUUserClient);
++	if (client == NULL || !client->initWithTask(kernel_task, NULL, 0)) {
++		IOLog("SWEET GPUT: could not create the user client\n");
++		OSSafeReleaseNULL(client);
 +		return;
 +	}
++	if (!client->attach(gSweetGPUService) || !client->start(gSweetGPUService)) {
++		IOLog("SWEET GPUT: user client attach/start failed\n");
++		client->release();
++		return;
++	}
++	IOReturn r;
 +	IOExternalMethodArguments a;
 +	uint64_t in[3] = { 0, 0, 0 }, out[3] = { 0, 0, 0 };
 +	bzero(&a, sizeof(a));
