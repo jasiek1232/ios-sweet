@@ -9,7 +9,7 @@
  bsd/dev/sweet_usb.c			standard
 --- /dev/null
 +++ b/bsd/dev/sweet_gpu_a619.c
-@@ -0,0 +1,3890 @@
+@@ -0,0 +1,3891 @@
 +/*
 + * miami (Motorola Edge 30 Neo, SM6375): Adreno 619 (GMU-wrapper "holi", chipid 0x6010901) bring-up.
 + *
@@ -3783,7 +3783,8 @@
 +	g_smmu_wr("CBAR0", base + 0x1000, (1u << 16) | (0xfu << 12) | (3u << 8));
 +	g_smmu_wr("CB0 TTBR0 lo", cb + 0x20, (uint32_t)gp.pt_pa);
 +	g_smmu_wr("CB0 TTBR0 hi", cb + 0x24, (uint32_t)((gp.pt_pa >> 32) | (1u << 16)));
-+	g_smmu_wr("CB0 TCR2", cb + 0x10, 0x2u);
++	/* PASIZE 2 (40-bit PA), SEP 7 = sign extension at the upstream address size (SEP 0 only accepts VAs below 2 GiB) */
++	g_smmu_wr("CB0 TCR2", cb + 0x10, 0x2u | (7u << 15));
 +	g_smmu_wr("CB0 TCR", cb + 0x30, 0x80803519u);
 +	g_smmu_wr("CB0 MAIR0", cb + 0x38, 0x000044ffu);   /* attr 0 write-back, attr 1 non-cacheable */
 +	g_smmu_wr("CB0 MAIR1", cb + 0x3c, 0x0u);
