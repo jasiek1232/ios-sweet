@@ -9,7 +9,7 @@
  bsd/dev/sweet_usb.c			standard
 --- /dev/null
 +++ b/bsd/dev/sweet_gpu_a619.c
-@@ -0,0 +1,3502 @@
+@@ -0,0 +1,3631 @@
 +/*
 + * miami (Motorola Edge 30 Neo, SM6375): Adreno 619 (GMU-wrapper "holi", chipid 0x6010901) bring-up.
 + *
@@ -1035,6 +1035,142 @@
 +	printf("SWEET GPUG: SPTPRAC status 0x%08x -> %s\n", st, ((st & 0x38u) == 0x28u) ? "SPTPRAC ON" : "SPTPRAC NOT ON");
 +	g_dwait(300);
 +	(void)g_smmu_r("RBBM_STATUS after", 0x05900840ULL);
++}
++
++/*
++ * GPU address space manager. The A619's kgsl SMMU context bank 0 walks 4 KiB-granule, 39-bit page tables
++ * (TCR 0x80803519: L1 1 GiB entries -> L2 2 MiB entries -> L3 4 KiB pages). All table pages come from one
++ * zeroed pool; L2/L3 pages are added on demand. Buffer objects (BOs) are physically contiguous kernel
++ * allocations mapped at an IOVA: dynamic IOVAs come from a bump allocator starting at G_IOVA_ARENA, fixed
++ * IOVAs are for the A2D blit demo whose command stream has its addresses baked in. Nothing is ever freed yet.
++ */
++#define G_PT_PAGES	64u		/* 4 KiB table pages in the pool (256 KiB) */
++#define G_IOVA_ARENA	0x00100000ull	/* dynamic allocations start here; below is the fixed demo layout */
++#define G_IOVA_END	0x04000000ull	/* the panel framebuffer blocks live at this IOVA */
++#define G_PTE_PAGE_WB	0x743ull	/* valid page, attr0 (write-back), inner shareable, AF */
++#define G_PTE_PAGE_NC	0x747ull	/* the same with attr1 (non-cacheable) */
++#define G_PTE_BLOCK_NC	0x745ull	/* 2 MiB block, attr1 */
++
++struct g_bo {
++	vm_offset_t kva;
++	uint64_t pa;
++	uint64_t iova;
++	size_t size;
++};
++
++static struct {
++	vm_offset_t pt_kva;
++	uint64_t pt_pa;
++	unsigned pt_used;
++	uint64_t next_iova;
++	struct g_bo res, sqe, ring, src, dst;
++} gp;
++
++static int
++g_as_init(void)
++{
++	vm_offset_t mem = 0;
++	if (gp.pt_kva)
++		return 1;
++	if (kmem_alloc_contig(kernel_map, &mem, G_PT_PAGES * 0x1000u, PAGE_MASK, 0, 0,
++	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		printf("SWEET GPUA: no memory for the page tables\n");
++		return 0;
++	}
++	gp.pt_kva = mem;
++	gp.pt_pa = ptoa_64(pmap_find_phys(kernel_pmap, (addr64_t)mem));
++	gp.pt_used = 1;		/* page 0 is the L1 table */
++	gp.next_iova = G_IOVA_ARENA;
++	return 1;
++}
++
++/* the entry of a table, creating the next-level table page when it is still empty */
++static volatile uint64_t *
++g_as_next(volatile uint64_t *tbl, unsigned idx)
++{
++	if (!(tbl[idx] & 1ull)) {
++		if (gp.pt_used >= G_PT_PAGES) {
++			printf("SWEET GPUA: page-table pool exhausted\n");
++			return NULL;
++		}
++		uint64_t pa = gp.pt_pa + (uint64_t)gp.pt_used * 0x1000u;
++		gp.pt_used++;
++		tbl[idx] = pa | 3ull;
++	}
++	uint64_t pa = tbl[idx] & 0x0000fffffffff000ull;
++	return (volatile uint64_t *)(gp.pt_kva + (vm_offset_t)(pa - gp.pt_pa));
++}
++
++static int
++g_as_map(uint64_t iova, uint64_t pa, size_t size, uint64_t pte)
++{
++	volatile uint64_t *l1 = (volatile uint64_t *)gp.pt_kva;
++	for (size_t off = 0; off < size; off += 0x1000) {
++		uint64_t v = iova + off;
++		volatile uint64_t *l2 = g_as_next(l1, (unsigned)((v >> 30) & 0x1ff));
++		volatile uint64_t *l3 = l2 ? g_as_next(l2, (unsigned)((v >> 21) & 0x1ff)) : NULL;
++		if (!l3)
++			return 0;
++		l3[(v >> 12) & 0x1ff] = (pa + off) | pte;
++	}
++	return 1;
++}
++
++static int
++g_as_map_2m(uint64_t iova, uint64_t pa)
++{
++	volatile uint64_t *l1 = (volatile uint64_t *)gp.pt_kva;
++	volatile uint64_t *l2 = g_as_next(l1, (unsigned)((iova >> 30) & 0x1ff));
++	if (!l2)
++		return 0;
++	l2[(iova >> 21) & 0x1ff] = pa | G_PTE_BLOCK_NC;
++	return 1;
++}
++
++/* make the table writes visible to the SMMU's table walker */
++static void
++g_as_sync(void)
++{
++	flush_dcache64((addr64_t)gp.pt_pa, G_PT_PAGES * 0x1000u, TRUE);
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
++/* allocate and map a BO; iova_fixed == 0 takes the next dynamic IOVA */
++static int
++g_bo_alloc(struct g_bo *bo, uint64_t iova_fixed, size_t size)
++{
++	size_t map = (size + 0xfffu) & ~(size_t)0xfffu;
++	size_t alloc = (size + PAGE_MASK) & ~(size_t)PAGE_MASK;
++	vm_offset_t mem = 0;
++	if (kmem_alloc_contig(kernel_map, &mem, alloc, PAGE_MASK, 0, 0,
++	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		printf("SWEET GPUA: no memory for a %lu byte BO\n", (unsigned long)size);
++		return 0;
++	}
++	uint64_t iova = iova_fixed;
++	if (!iova) {
++		iova = gp.next_iova;
++		if (iova + map + 0x1000 > G_IOVA_END) {
++			printf("SWEET GPUA: out of IOVA space\n");
++			return 0;
++		}
++		gp.next_iova = iova + map + 0x1000;	/* one unmapped guard page after each BO */
++	}
++	bo->kva = mem;
++	bo->pa = ptoa_64(pmap_find_phys(kernel_pmap, (addr64_t)mem));
++	bo->iova = iova;
++	bo->size = size;
++	if (!g_as_map(iova, bo->pa, map, G_PTE_PAGE_WB))
++		return 0;
++	g_vprintf("SWEET GPUA: BO iova 0x%llx pa 0x%llx size 0x%lx\n", (unsigned long long)iova,
++	    (unsigned long long)bo->pa, (unsigned long)size);
++	return 1;
++}
++
++static void
++g_bo_flush(const struct g_bo *bo)
++{
++	flush_dcache64((addr64_t)bo->pa, (unsigned)((bo->size + PAGE_MASK) & ~(size_t)PAGE_MASK), TRUE);
 +}
 +
 +static const uint8_t g_sqe_fw[34188] = {
@@ -3273,10 +3409,10 @@
 +};
 +
 +__attribute__((optnone, noinline)) static void
-+g_blit_test(vm_offset_t mem, uint64_t pa0, volatile uint32_t *ring, uint32_t *wptr)
++g_blit_test(volatile uint32_t *ring, uint64_t ring_pa, uint32_t *wptr)
 +{
-+	volatile uint32_t *src = (volatile uint32_t *)(mem + 0x30000);
-+	volatile uint32_t *dst = (volatile uint32_t *)(mem + 0x40000);
++	volatile uint32_t *src = (volatile uint32_t *)gp.src.kva;
++	volatile uint32_t *dst = (volatile uint32_t *)gp.dst.kva;
 +	const uint32_t *dw = g_blit_dw;
 +	const unsigned n = sizeof(g_blit_dw) / sizeof(g_blit_dw[0]);
 +	printf("SWEET GPUB: blit stream %u dwords\n", n);
@@ -3298,9 +3434,9 @@
 +				src[y * 128 + x] = 0xff000000u | ((x * 2) << 16) | ((y * 2) << 8) | blue;
 +		for (unsigned i = 0; i < 384 * 384; i++)
 +			dst[i] = 0x00112233u;
-+		flush_dcache64((addr64_t)(pa0 + 0x30000), 0x10000, TRUE);
-+		flush_dcache64((addr64_t)(pa0 + 0x40000), 0x90000, TRUE);
-+		int ok = g_ring_submit(ring, pa0 + 0x20000, wptr, dw, n, frame == 0 ? "A2D blit" : "A2D blit (again)");
++		flush_dcache64((addr64_t)gp.src.pa, 0x10000, TRUE);
++		flush_dcache64((addr64_t)gp.dst.pa, 0x90000, TRUE);
++		int ok = g_ring_submit(ring, ring_pa, wptr, dw, n, frame == 0 ? "A2D blit" : "A2D blit (again)");
 +		uint32_t stv = 0;
 +		for (int i = 0; i < 500; i++) {
 +			stv = *(volatile uint32_t *)st_va;
@@ -3308,7 +3444,7 @@
 +				break;
 +			g_dwait(1);
 +		}
-+		flush_dcache64((addr64_t)(pa0 + 0x40000), 0x90000, TRUE);
++		flush_dcache64((addr64_t)gp.dst.pa, 0x90000, TRUE);
 +		if (frame == 0) {
 +			unsigned untouched = 0;
 +			for (unsigned i = 0; i < 384 * 384; i++)
@@ -3380,38 +3516,31 @@
 +		g_gw("UCHE_CLIENT_PF", 0xe19, 0x81);
 +	}
 +
-+	/* memory: tables + result + SQE + ringbuffer in one block, IOVA == block offset */
-+	vm_offset_t mem = 0;
-+	if (kmem_alloc_contig(kernel_map, &mem, 0xd0000, PAGE_MASK, 0, 0,
-+	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
-+		printf("SWEET GPUR: no memory for the GPU block\n");
++	/* address space + buffer objects. The blit stream has the result page (0x4000), source (0x30000) and
++	 * destination (0x40000) addresses baked in, so those three use fixed IOVAs; SQE and ring are dynamic. */
++	if (!g_as_init())
++		return;
++	if (!g_bo_alloc(&gp.res, 0x4000, 0x1000) || !g_bo_alloc(&gp.sqe, 0, sizeof(g_sqe_fw) - 4) ||
++	    !g_bo_alloc(&gp.ring, 0, 0x8000) ||
++	    (blit && (!g_bo_alloc(&gp.src, 0x30000, 0x10000) || !g_bo_alloc(&gp.dst, 0x40000, 0x90000)))) {
++		printf("SWEET GPUR: could not allocate the GPU buffers\n");
 +		return;
 +	}
-+	uint64_t pa0 = ptoa_64(pmap_find_phys(kernel_pmap, (addr64_t)mem));
-+	volatile uint64_t *l1 = (volatile uint64_t *)mem;
-+	volatile uint64_t *l2 = (volatile uint64_t *)(mem + 0x1000);
-+	volatile uint64_t *l3 = (volatile uint64_t *)(mem + 0x2000);
-+	volatile uint32_t *res = (volatile uint32_t *)(mem + 0x4000);
-+	volatile uint32_t *ring = (volatile uint32_t *)(mem + 0x20000);
-+	l1[0] = (pa0 + 0x1000) | 3u;
-+	l2[0] = (pa0 + 0x2000) | 3u;
-+	l3[0x04] = (pa0 + 0x4000) | 0x743u;
-+	for (unsigned i = 0; i < 9; i++)
-+		l3[0x10 + i] = (pa0 + 0x10000 + i * 0x1000ull) | 0x743u;
-+	for (unsigned i = 0; i < 8; i++)
-+		l3[0x20 + i] = (pa0 + 0x20000 + i * 0x1000ull) | 0x743u;
-+	for (unsigned i = 0; i < 16; i++)
-+		l3[0x30 + i] = (pa0 + 0x30000 + i * 0x1000ull) | 0x743u;
-+	for (unsigned i = 0; i < 144; i++)
-+		l3[0x40 + i] = (pa0 + 0x40000 + i * 0x1000ull) | 0x743u;
 +	/* the panel framebuffer (splash region, 12 MiB, 2 MiB aligned) as six 2 MiB blocks at IOVA 0x4000000, non-cacheable */
 +	for (unsigned i = 0; i < 6; i++)
-+		l2[32 + i] = (0x85200000ull + i * 0x200000ull) | 0x745u;
-+	memcpy((void *)(mem + 0x10000), g_sqe_fw + 4, sizeof(g_sqe_fw) - 4);
++		(void)g_as_map_2m(0x4000000ull + i * 0x200000ull, 0x85200000ull + i * 0x200000ull);
++	volatile uint32_t *res = (volatile uint32_t *)gp.res.kva;
++	volatile uint32_t *ring = (volatile uint32_t *)gp.ring.kva;
++	const uint64_t ring_pa = gp.ring.pa;
++	memcpy((void *)gp.sqe.kva, g_sqe_fw + 4, sizeof(g_sqe_fw) - 4);
 +	res[0] = 0x11111111u;
-+	flush_dcache64((addr64_t)pa0, 0xd0000, TRUE);
-+	printf("SWEET GPUR: block PA 0x%llx, SQE %u bytes, first words 0x%08x 0x%08x\n", (unsigned long long)pa0,
-+	    (unsigned)(sizeof(g_sqe_fw) - 4), *(volatile uint32_t *)(mem + 0x10000), *(volatile uint32_t *)(mem + 0x10004));
++	g_bo_flush(&gp.res);
++	g_bo_flush(&gp.sqe);
++	g_bo_flush(&gp.ring);
++	g_as_sync();
++	printf("SWEET GPUR: page tables PA 0x%llx, SQE %u bytes at IOVA 0x%llx, ring at IOVA 0x%llx, first words 0x%08x 0x%08x\n",
++	    (unsigned long long)gp.pt_pa, (unsigned)(sizeof(g_sqe_fw) - 4), (unsigned long long)gp.sqe.iova,
++	    (unsigned long long)gp.ring.iova, *(volatile uint32_t *)gp.sqe.kva, *(volatile uint32_t *)(gp.sqe.kva + 4));
 +	g_dwait(300);
 +
 +	const uint64_t base = 0x05940000ULL;
@@ -3420,8 +3549,8 @@
 +	g_smmu_wr("S2CR0", base + 0xc00, 0x00000000u);
 +	g_smmu_wr("CBA2R0", base + 0x1800, 0x00000001u);
 +	g_smmu_wr("CBAR0", base + 0x1000, (1u << 16) | (0xfu << 12) | (3u << 8));
-+	g_smmu_wr("CB0 TTBR0 lo", cb + 0x20, (uint32_t)pa0);
-+	g_smmu_wr("CB0 TTBR0 hi", cb + 0x24, (uint32_t)((pa0 >> 32) | (1u << 16)));
++	g_smmu_wr("CB0 TTBR0 lo", cb + 0x20, (uint32_t)gp.pt_pa);
++	g_smmu_wr("CB0 TTBR0 hi", cb + 0x24, (uint32_t)((gp.pt_pa >> 32) | (1u << 16)));
 +	g_smmu_wr("CB0 TCR2", cb + 0x10, 0x2u);
 +	g_smmu_wr("CB0 TCR", cb + 0x30, 0x80803519u);
 +	g_smmu_wr("CB0 MAIR0", cb + 0x38, 0x000044ffu);   /* attr 0 write-back, attr 1 non-cacheable */
@@ -3429,8 +3558,8 @@
 +	g_smmu_wr("CB0 SCTLR", cb, 0x67u);
 +
 +	/* CP: microcode, ringbuffer, start */
-+	g_gw64("CP_SQE_INSTR_BASE", 0x830, 0x10000ull);
-+	g_gw64("CP_RB_BASE", 0x800, 0x20000ull);
++	g_gw64("CP_SQE_INSTR_BASE", 0x830, gp.sqe.iova);
++	g_gw64("CP_RB_BASE", 0x800, gp.ring.iova);
 +	g_gw("CP_RB_CNTL", 0x802, 0x0800020cu);   /* 32 KiB ring, 32 byte blocks, no RPTR shadow */
 +	g_gw("CP_RB_WPTR", 0x807, 0);
 +	g_cp_state("before SQE start");
@@ -3440,7 +3569,7 @@
 +
 +	uint32_t wptr = 0;
 +	const uint32_t init[9] = { G_PKT7(0x48, 8), 0x2f, 3, 0x20000000u, 0, 0, 0, 0, 0 };
-+	if (!g_ring_submit(ring, pa0 + 0x20000, &wptr, init, 9, "CP_ME_INIT")) {
++	if (!g_ring_submit(ring, ring_pa, &wptr, init, 9, "CP_ME_INIT")) {
 +		g_cp_fail("after ME_INIT (not consumed)");
 +		return;
 +	}
@@ -3451,18 +3580,18 @@
 +	g_zap_load();
 +
 +	const uint32_t sec[2] = { G_PKT7(0x66, 1), 0 };
-+	(void)g_ring_submit(ring, pa0 + 0x20000, &wptr, sec, 2, "CP_SET_SECURE_MODE(0)");
++	(void)g_ring_submit(ring, ring_pa, &wptr, sec, 2, "CP_SET_SECURE_MODE(0)");
 +	g_cp_state("after SET_SECURE_MODE");
 +
 +	const uint32_t wr[5] = { G_PKT7(0x3d, 3), 0x4000, 0, 0xcafebabeu, 0 };
-+	(void)g_ring_submit(ring, pa0 + 0x20000, &wptr, wr, 4, "CP_MEM_WRITE 0xcafebabe -> IOVA 0x4000");
-+	flush_dcache64((addr64_t)(pa0 + 0x4000), 0x1000, TRUE);
++	(void)g_ring_submit(ring, ring_pa, &wptr, wr, 4, "CP_MEM_WRITE 0xcafebabe -> IOVA 0x4000");
++	flush_dcache64((addr64_t)gp.res.pa, 0x1000, TRUE);
 +	uint32_t got = res[0];
 +	printf("SWEET GPUR: result page word = 0x%08x -> %s\n", got, got == 0xcafebabeu ? "GPU WROTE MEMORY" : "not written");
 +	g_dwait(150);
 +	g_cp_state("end");
 +	if (blit && got == 0xcafebabeu)
-+		g_blit_test(mem, pa0, ring, &wptr);
++		g_blit_test(ring, ring_pa, &wptr);
 +}
 +
 +static void
