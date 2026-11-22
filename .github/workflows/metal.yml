@@ -47,7 +47,7 @@ jobs:
 
       - name: Deps
         run: |
-          brew install ninja bison flex
+          brew install ninja bison flex glslang
           cd flame
           mkdir -p work/turnip
           python3 -m venv work/turnip/venv
@@ -131,10 +131,10 @@ jobs:
         run: |
           cd flame
           mkdir -p work
-          git init -q work/metal2vulkan
+          # full clone: GitHub will not serve an abbreviated hash through a shallow fetch
+          git clone -q https://github.com/steelbrain/metal2vulkan work/metal2vulkan
           cd work/metal2vulkan
-          git fetch -q --depth 1 https://github.com/steelbrain/metal2vulkan "$M2V_SHA"
-          git checkout -q FETCH_HEAD
+          git checkout -q "$M2V_SHA"
           git log -1 --format='metal2vulkan %h %s'
           for f in ../../phone/metal2/bridge/patches/*.patch; do
             echo "== $f"
