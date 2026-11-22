@@ -99,6 +99,22 @@ jobs:
           PY
           grep -n "D_DARWIN_C_SOURCE" tools/build-turnip-ios.sh
 
+      - name: Match the ABI header to UniXNU's current Turnip backend
+        run: |
+          # UniXNU's main branch is newer than the ios-flame commit: tu_knl_darwin.cc tests a params flag that
+          # flame's NativeAdrenoABI.h (v1) lacks. The kernel never sets it (our BOs are write-combined), so the
+          # new name only has to exist. Value 2 is the next free bit after HostImport.
+          cd flame
+          python3 - <<'PY'
+          p = 'phone/turnip/NativeAdrenoABI.h'
+          s = open(p).read()
+          a = "    NativeAdrenoParamsHostImport = 1  /*"
+          assert s.count(a) == 1, 'params flag enum not found'
+          s = s.replace(a, "    NativeAdrenoParamsOwnedCoherent = 2, /* newer backends: BOs are IO-coherent (never set by our kernel) */\n    NativeAdrenoParamsHostImport = 1  /*")
+          open(p, 'w').write(s)
+          PY
+          grep -n "OwnedCoherent" phone/turnip/NativeAdrenoABI.h
+
       - name: Build Turnip for iOS 16
         run: |
           cd flame
