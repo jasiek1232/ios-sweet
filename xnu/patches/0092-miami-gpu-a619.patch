@@ -9,7 +9,7 @@
  bsd/dev/sweet_usb.c			standard
 --- /dev/null
 +++ b/bsd/dev/sweet_gpu_a619.c
-@@ -0,0 +1,3631 @@
+@@ -0,0 +1,3731 @@
 +/*
 + * miami (Motorola Edge 30 Neo, SM6375): Adreno 619 (GMU-wrapper "holi", chipid 0x6010901) bring-up.
 + *
@@ -38,11 +38,20 @@
 +#include <arm/caches_internal.h>
 +#include <vm/pmap.h>
 +#include <vm/vm_kern.h>
++#include <kern/locks.h>
 +
 +extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
 +extern kern_return_t thread_terminate(thread_t);
 +extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
 +void sweet_gpu_a619_start(void);
++/*
++ * Submission service (valid once the GPU is up, after the self test): queue a command stream on the ring and
++ * get a sequence number back; sweet_gpu_wait() polls until the GPU has executed everything up to that number.
++ * Each submission is followed by WAIT_FOR_IDLE and a CP_MEM_WRITE of its sequence number to a fence page.
++ * Returns 0 on success. Safe to call from several threads.
++ */
++int sweet_gpu_submit(const uint32_t *cmds, unsigned n, uint32_t *seq);
++int sweet_gpu_wait(uint32_t seq, unsigned timeout_ms);
 +
 +static int g_dbg;           /* sweetgpudebug=1 */
 +static int g_sleep_chan;
@@ -1063,7 +1072,7 @@
 +	uint64_t pt_pa;
 +	unsigned pt_used;
 +	uint64_t next_iova;
-+	struct g_bo res, sqe, ring, src, dst;
++	struct g_bo res, sqe, ring, fence, src, dst;
 +} gp;
 +
 +static int
@@ -1126,6 +1135,14 @@
 +	l2[(iova >> 21) & 0x1ff] = pa | G_PTE_BLOCK_NC;
 +	return 1;
 +}
++
++static LCK_GRP_DECLARE(g_svc_grp, "sweet_gpu");
++static LCK_MTX_DECLARE(g_svc_lock, &g_svc_grp);
++static struct {
++	int ready;
++	uint32_t wptr, seq;
++	vm_offset_t rptr_va, wptr_va;
++} svc;
 +
 +/* make the table writes visible to the SMMU's table walker */
 +static void
@@ -3374,6 +3391,61 @@
 +	return rp == *wptr;
 +}
 +
++#define G_RING_DW 0x2000u
++
++__attribute__((optnone, noinline)) int
++sweet_gpu_submit(const uint32_t *cmds, unsigned n, uint32_t *seq_out)
++{
++	volatile uint32_t *ring = (volatile uint32_t *)gp.ring.kva;
++	const unsigned total = n + 5;	/* + WAIT_FOR_IDLE (1) + CP_MEM_WRITE fence (4) */
++	unsigned tries = 0;
++
++	if (!svc.ready || n == 0 || total > G_RING_DW / 2)
++		return -1;
++	for (;;) {
++		lck_mtx_lock(&g_svc_lock);
++		uint32_t rp = *(volatile uint32_t *)svc.rptr_va;
++		uint32_t used = (svc.wptr - rp) & (G_RING_DW - 1);
++		if (G_RING_DW - 1 - used >= total)
++			break;		/* enough room; the lock stays held */
++		lck_mtx_unlock(&g_svc_lock);
++		if (++tries > 5000)
++			return -2;	/* ring stayed full for ~5 s: the GPU is stuck */
++		g_settle(1);
++	}
++	uint32_t w = svc.wptr;
++	for (unsigned i = 0; i < n; i++)
++		ring[(w + i) & (G_RING_DW - 1)] = cmds[i];
++	w += n;
++	const uint32_t seq = ++svc.seq;
++	const uint32_t tail[5] = { G_PKT7(0x26, 0), G_PKT7(0x3d, 3), (uint32_t)gp.fence.iova,
++		(uint32_t)(gp.fence.iova >> 32), seq };
++	for (unsigned i = 0; i < 5; i++)
++		ring[(w + i) & (G_RING_DW - 1)] = tail[i];
++	w += 5;
++	flush_dcache64((addr64_t)gp.ring.pa, 0x8000, TRUE);
++	__asm__ volatile ("dsb sy" ::: "memory");
++	svc.wptr = w & (G_RING_DW - 1);
++	*(volatile uint32_t *)svc.wptr_va = svc.wptr;
++	__asm__ volatile ("dsb sy" ::: "memory");
++	lck_mtx_unlock(&g_svc_lock);
++	*seq_out = seq;
++	return 0;
++}
++
++__attribute__((optnone, noinline)) int
++sweet_gpu_wait(uint32_t seq, unsigned timeout_ms)
++{
++	volatile uint32_t *f = (volatile uint32_t *)gp.fence.kva;
++	for (unsigned i = 0; i <= timeout_ms; i++) {
++		flush_dcache64((addr64_t)gp.fence.pa, 0x1000, TRUE);
++		if ((int32_t)(*f - seq) >= 0)
++			return 0;
++		g_settle(1);
++	}
++	return -1;
++}
++
 +/*
 + * stage 17: a real graphics operation. The A6xx 2D engine (CP_BLIT, op SCALE) scales a 128x128 gradient
 + * texture to 384x384 with bilinear filtering into a pitch-aligned GPU buffer, the same stream Mesa's turnip
@@ -3409,7 +3481,7 @@
 +};
 +
 +__attribute__((optnone, noinline)) static void
-+g_blit_test(volatile uint32_t *ring, uint64_t ring_pa, uint32_t *wptr)
++g_blit_test(void)
 +{
 +	volatile uint32_t *src = (volatile uint32_t *)gp.src.kva;
 +	volatile uint32_t *dst = (volatile uint32_t *)gp.dst.kva;
@@ -3436,7 +3508,8 @@
 +			dst[i] = 0x00112233u;
 +		flush_dcache64((addr64_t)gp.src.pa, 0x10000, TRUE);
 +		flush_dcache64((addr64_t)gp.dst.pa, 0x90000, TRUE);
-+		int ok = g_ring_submit(ring, ring_pa, wptr, dw, n, frame == 0 ? "A2D blit" : "A2D blit (again)");
++		uint32_t seq = 0;
++		int ok = sweet_gpu_submit(dw, n, &seq) == 0 && sweet_gpu_wait(seq, 300) == 0;
 +		uint32_t stv = 0;
 +		for (int i = 0; i < 500; i++) {
 +			stv = *(volatile uint32_t *)st_va;
@@ -3521,7 +3594,7 @@
 +	if (!g_as_init())
 +		return;
 +	if (!g_bo_alloc(&gp.res, 0x4000, 0x1000) || !g_bo_alloc(&gp.sqe, 0, sizeof(g_sqe_fw) - 4) ||
-+	    !g_bo_alloc(&gp.ring, 0, 0x8000) ||
++	    !g_bo_alloc(&gp.ring, 0, 0x8000) || !g_bo_alloc(&gp.fence, 0, 0x1000) ||
 +	    (blit && (!g_bo_alloc(&gp.src, 0x30000, 0x10000) || !g_bo_alloc(&gp.dst, 0x40000, 0x90000)))) {
 +		printf("SWEET GPUR: could not allocate the GPU buffers\n");
 +		return;
@@ -3537,6 +3610,7 @@
 +	g_bo_flush(&gp.res);
 +	g_bo_flush(&gp.sqe);
 +	g_bo_flush(&gp.ring);
++	g_bo_flush(&gp.fence);
 +	g_as_sync();
 +	printf("SWEET GPUR: page tables PA 0x%llx, SQE %u bytes at IOVA 0x%llx, ring at IOVA 0x%llx, first words 0x%08x 0x%08x\n",
 +	    (unsigned long long)gp.pt_pa, (unsigned)(sizeof(g_sqe_fw) - 4), (unsigned long long)gp.sqe.iova,
@@ -3590,8 +3664,34 @@
 +	printf("SWEET GPUR: result page word = 0x%08x -> %s\n", got, got == 0xcafebabeu ? "GPU WROTE MEMORY" : "not written");
 +	g_dwait(150);
 +	g_cp_state("end");
-+	if (blit && got == 0xcafebabeu)
-+		g_blit_test(ring, ring_pa, &wptr);
++	if (got != 0xcafebabeu)
++		return;
++	svc.rptr_va = g_gpu_map(G_CP_BASE + 0x806 * 4);
++	svc.wptr_va = g_gpu_map(G_CP_BASE + 0x807 * 4);
++	svc.wptr = wptr;
++	svc.seq = 0;
++	svc.ready = 1;
++	printf("SWEET GPUQ: submission service ready (ring wptr %u)\n", wptr);
++	{
++		/* 16 submissions queued back to back, one wait at the end: each writes its own word of the result page */
++		uint32_t seq = 0;
++		unsigned queued = 0, ok = 0;
++		for (unsigned i = 0; i < 16; i++) {
++			const uint32_t w[4] = { G_PKT7(0x3d, 3), 0x4100u + i * 4u, 0, 0x5a5a0000u + i };
++			if (sweet_gpu_submit(w, 4, &seq) != 0)
++				break;
++			queued++;
++		}
++		int wr = sweet_gpu_wait(seq, 500);
++		flush_dcache64((addr64_t)gp.res.pa, 0x1000, TRUE);
++		for (unsigned i = 0; i < queued; i++)
++			if (res[0x40 + i] == 0x5a5a0000u + i)
++				ok++;
++		printf("SWEET GPUQ: %u submissions queued, wait %s, %u of %u results correct, last seq %u\n", queued,
++		    wr == 0 ? "ok" : "TIMED OUT", ok, queued, seq);
++	}
++	if (blit)
++		g_blit_test();
 +}
 +
 +static void
