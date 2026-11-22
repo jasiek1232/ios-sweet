@@ -9,7 +9,7 @@
  bsd/dev/sweet_usb.c			standard
 --- /dev/null
 +++ b/bsd/dev/sweet_gpu_a619.c
-@@ -0,0 +1,3891 @@
+@@ -0,0 +1,3979 @@
 +/*
 + * miami (Motorola Edge 30 Neo, SM6375): Adreno 619 (GMU-wrapper "holi", chipid 0x6010901) bring-up.
 + *
@@ -1135,6 +1135,8 @@
 +	l2[(iova >> 21) & 0x1ff] = pa | G_PTE_BLOCK_NC;
 +	return 1;
 +}
++
++static int g_gpu_recover(void);
 +
 +static LCK_GRP_DECLARE(g_svc_grp, "sweet_gpu");
 +static LCK_MTX_DECLARE(g_svc_lock, &g_svc_grp);
@@ -3533,9 +3535,8 @@
 +			uint32_t syn = *(volatile uint32_t *)(cb + 0x68);
 +			printf("SWEET GPUQ: user IB %llx (%u dwords) timed out: smmu fsr 0x%x far 0x%llx fsynr0 0x%x\n",
 +			    (unsigned long long)ib_iova, dwords, fsr, (unsigned long long)far, syn);
-+			*(volatile uint32_t *)(cb + 0x58) = fsr;	/* a fault stops the GPU's writes until FSR is cleared */
-+			__asm__ volatile ("dsb sy" ::: "memory");
 +		}
++		(void)g_gpu_recover();
 +	}
 +	return rc;
 +}
@@ -3602,6 +3603,108 @@
 +		    (unsigned long long)g_user_end);
 +	else
 +		printf("SWEET GPUQ: client mappings stay disabled\n");
++}
++
++/* hw_init register setup, same values as Linux for an A619 holi */
++static void
++g_hw_regs(void)
++{
++	g_gw("CP_ADDR_MODE_CNTL", 0x842, 1);
++	g_gw("VSC_ADDR_MODE_CNTL", 0xc01, 1);
++	g_gw("GRAS_ADDR_MODE_CNTL", 0x8601, 1);
++	g_gw("RB_ADDR_MODE_CNTL", 0x8e05, 1);
++	g_gw("PC_ADDR_MODE_CNTL", 0x9e01, 1);
++	g_gw("HLSQ_ADDR_MODE_CNTL", 0xbe05, 1);
++	g_gw("VFD_ADDR_MODE_CNTL", 0xa601, 1);
++	g_gw("VPC_ADDR_MODE_CNTL", 0x9601, 1);
++	g_gw("UCHE_ADDR_MODE_CNTL", 0xe00, 1);
++	g_gw("SP_ADDR_MODE_CNTL", 0xae01, 1);
++	g_gw("TPL1_ADDR_MODE_CNTL", 0xb601, 1);
++	g_gw("RBBM_SECVID_TSB_ADDR_MODE_CNTL", 0xf810, 1);
++	g_gw("RBBM_VBIF_CLIENT_QOS_CNTL", 0x10, 3);
++	g_gw("RBBM_PERFCTR_GPU_BUSY_MASKED", 0x50b, 0xffffffffu);
++	g_gw64("UCHE_WRITE_RANGE_MAX", 0xe05, 0x1fffffffff000ull + 0xfc0);
++	g_gw64("UCHE_TRAP_BASE", 0xe09, 0x1fffffffff000ull);
++	g_gw64("UCHE_WRITE_THRU_BASE", 0xe07, 0x1fffffffff000ull);
++	g_gw64("UCHE_GMEM_RANGE_MIN", 0xe0b, 0x100000ull);
++	g_gw64("UCHE_GMEM_RANGE_MAX", 0xe0d, 0x100000ull + 0x80000ull - 1);
++	g_gw("UCHE_FILTER_CNTL", 0xe18, 0x804);
++	g_gw("UCHE_CACHE_WAYS", 0xe17, 0x4);
++	g_gw("CP_ROQ_THRESHOLDS_2", 0x8c2, 0x010000c0u);
++	g_gw("CP_ROQ_THRESHOLDS_1", 0x8c1, 0x8040362cu);
++	g_gw("CP_MEM_POOL_SIZE", 0x8c3, 128);
++	g_gw("CP_AHB_CNTL", 0x98d, 1);
++	g_gw("RBBM_PERFCTR_CNTL", 0x500, 1);
++	g_gw("UCHE_CLIENT_PF", 0xe19, 0x81);
++}
++
++static void
++g_clear_fault(void)
++{
++	vm_offset_t cb = g_gpu_map(0x05948000ull);
++	if (!cb)
++		return;
++	uint32_t fsr = *(volatile uint32_t *)(cb + 0x58);
++	*(volatile uint32_t *)(cb + 0x58) = fsr;	/* a fault stops the GPU's writes until FSR is cleared */
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
++/*
++ * After a hang or an SMMU fault: soft reset of the GPU core, then the CP up again (page tables, SMMU context
++ * bank and buffers are kept; the zap shader is still in TrustZone and is resumed, not reloaded). Submissions in
++ * flight are lost. 0 = the GPU works again.
++ */
++static int
++g_gpu_recover(void)
++{
++	volatile uint32_t *ring = (volatile uint32_t *)gp.ring.kva;
++	uint32_t wptr = 0;
++	uint64_t val = 0;
++	int rc = -1;
++
++	lck_mtx_lock(&g_svc_lock);
++	svc.ready = 0;
++	printf("SWEET GPUQ: recovering the GPU (soft reset)\n");
++	g_clear_fault();
++	g_gw("RBBM_SW_RESET_CMD", 0x43, 1);
++	g_settle(1);
++	g_gw("RBBM_SW_RESET_CMD", 0x43, 0);
++	g_settle(2);
++	g_clear_fault();
++	g_wrapper_up();
++	g_hw_regs();
++	for (unsigned i = 0; i < G_RING_DW; i++)
++		ring[i] = 0;
++	flush_dcache64((addr64_t)gp.ring.pa, 0x8000, TRUE);
++	g_gw64("CP_SQE_INSTR_BASE", 0x830, gp.sqe.iova);
++	g_gw64("CP_RB_BASE", 0x800, gp.ring.iova);
++	g_gw("CP_RB_CNTL", 0x802, 0x0800020cu);
++	g_gw("CP_RB_WPTR", 0x807, 0);
++	g_gw("CP_SQE_CNTL (start)", 0x808, 1);
++	g_settle(10);
++	const uint32_t init[9] = { G_PKT7(0x48, 8), 0x2f, 3, 0x20000000u, 0, 0, 0, 0, 0 };
++	const uint32_t sec[2] = { G_PKT7(0x66, 1), 0 };
++	if (g_ring_submit(ring, gp.ring.pa, &wptr, init, 9, "CP_ME_INIT (recovery)")) {
++		int zr = g_smc5(G_SCM_FN(0x01, 0x0a), 0x2, 0 /* resume */, G_ZAP_PAS, 0, &val);
++		printf("SWEET GPUQ: zap shader resume -> ret 0x%x\n", (unsigned)zr);
++		if (zr == 0 && g_ring_submit(ring, gp.ring.pa, &wptr, sec, 2, "CP_SET_SECURE_MODE(0) (recovery)")) {
++			svc.wptr = wptr;
++			rc = 0;
++		}
++	}
++	svc.ready = rc == 0;
++	lck_mtx_unlock(&g_svc_lock);
++	if (rc == 0) {
++		/* prove it: one fenced submission */
++		const uint32_t nop[1] = { G_PKT7(0x10, 0) };
++		uint32_t seq = 0;
++		if (sweet_gpu_submit(nop, 1, &seq) != 0 || sweet_gpu_wait(seq, 200) != 0) {
++			svc.ready = 0;
++			rc = -1;
++		}
++	}
++	printf("SWEET GPUQ: GPU recovery %s\n", rc == 0 ? "OK" : "FAILED, GPU left disabled");
++	return rc;
 +}
 +
 +/*
@@ -3702,8 +3805,9 @@
 +}
 +
 +__attribute__((optnone, noinline)) static void
-+g_cp_test(int blit)
++g_cp_test(int mode)
 +{
++	const int blit = mode >= 2;
 +	/* GCC clocks the GPU's memory path needs (Linux: gcc_gpu_cfg_ahb, gcc_gpu_memnoc_gfx, gcc_gpu_snoc_dvm_gfx) */
 +	vm_offset_t gg = g_gpu_map(0x01436000ULL);
 +	volatile uint32_t *gc = (volatile uint32_t *)gg;
@@ -3716,36 +3820,7 @@
 +	printf("SWEET GPUR: GCC gpu_cfg_ahb 0x%08x memnoc_gfx 0x%08x snoc_dvm_gfx 0x%08x (bit31 = still off)\n", gc[0x04 / 4], gc[0x0c / 4], gc[0x18 / 4]);
 +	g_dwait(300);
 +
-+	/* hw_init register setup, same values as Linux for an A619 holi */
-+	for (int pass = 0; pass < 1; pass++) {
-+		g_gw("CP_ADDR_MODE_CNTL", 0x842, 1);
-+		g_gw("VSC_ADDR_MODE_CNTL", 0xc01, 1);
-+		g_gw("GRAS_ADDR_MODE_CNTL", 0x8601, 1);
-+		g_gw("RB_ADDR_MODE_CNTL", 0x8e05, 1);
-+		g_gw("PC_ADDR_MODE_CNTL", 0x9e01, 1);
-+		g_gw("HLSQ_ADDR_MODE_CNTL", 0xbe05, 1);
-+		g_gw("VFD_ADDR_MODE_CNTL", 0xa601, 1);
-+		g_gw("VPC_ADDR_MODE_CNTL", 0x9601, 1);
-+		g_gw("UCHE_ADDR_MODE_CNTL", 0xe00, 1);
-+		g_gw("SP_ADDR_MODE_CNTL", 0xae01, 1);
-+		g_gw("TPL1_ADDR_MODE_CNTL", 0xb601, 1);
-+		g_gw("RBBM_SECVID_TSB_ADDR_MODE_CNTL", 0xf810, 1);
-+		g_gw("RBBM_VBIF_CLIENT_QOS_CNTL", 0x10, 3);
-+		g_gw("RBBM_PERFCTR_GPU_BUSY_MASKED", 0x50b, 0xffffffffu);
-+		g_gw64("UCHE_WRITE_RANGE_MAX", 0xe05, 0x1fffffffff000ull + 0xfc0);
-+		g_gw64("UCHE_TRAP_BASE", 0xe09, 0x1fffffffff000ull);
-+		g_gw64("UCHE_WRITE_THRU_BASE", 0xe07, 0x1fffffffff000ull);
-+		g_gw64("UCHE_GMEM_RANGE_MIN", 0xe0b, 0x100000ull);
-+		g_gw64("UCHE_GMEM_RANGE_MAX", 0xe0d, 0x100000ull + 0x80000ull - 1);
-+		g_gw("UCHE_FILTER_CNTL", 0xe18, 0x804);
-+		g_gw("UCHE_CACHE_WAYS", 0xe17, 0x4);
-+		g_gw("CP_ROQ_THRESHOLDS_2", 0x8c2, 0x010000c0u);
-+		g_gw("CP_ROQ_THRESHOLDS_1", 0x8c1, 0x8040362cu);
-+		g_gw("CP_MEM_POOL_SIZE", 0x8c3, 128);
-+		g_gw("CP_AHB_CNTL", 0x98d, 1);
-+		g_gw("RBBM_PERFCTR_CNTL", 0x500, 1);
-+		g_gw("UCHE_CLIENT_PF", 0xe19, 0x81);
-+	}
++	g_hw_regs();
 +
 +	/* address space + buffer objects. The blit stream has the result page (0x4000), source (0x30000) and
 +	 * destination (0x40000) addresses baked in, so those three use fixed IOVAs; SQE and ring are dynamic. */
@@ -3852,6 +3927,19 @@
 +	if (blit)
 +		g_blit_test();
 +	g_user_probes();
++	if (mode >= 3) {
++		/* recovery test: a command stream at an address nothing maps faults the SMMU and wedges the CP */
++		uint32_t fence = 0, seq = 0;
++		const uint32_t w[4] = { G_PKT7(0x3d, 3), 0x4200u, 0, 0x600dbeefu };
++		printf("SWEET GPUQ: recovery test: running an indirect buffer at unmapped IOVA 0x300000000\n");
++		int sr = sweet_gpu_submit_user(0x300000000ull, 4, 500, &fence);
++		int ok = sweet_gpu_submit(w, 4, &seq) == 0 && sweet_gpu_wait(seq, 500) == 0;
++		flush_dcache64((addr64_t)gp.res.pa, 0x1000, TRUE);
++		uint32_t v = res[0x80];
++		printf("SWEET GPUQ: recovery test: faulting IB %s, later submit %s, word 0x%08x -> %s\n",
++		    sr ? "failed as expected" : "did NOT fail", ok ? "ok" : "FAILED", v,
++		    (ok && v == 0x600dbeefu) ? "GPU RECOVERED" : "not recovered");
++	}
 +}
 +
 +static void
@@ -3874,7 +3962,7 @@
 +	g_dwait(500);
 +	if (g_gdsc_on("CX", 0x0599106cULL) && g_gx_sequence() && g_gpu_clock_up()) {
 +		g_wrapper_up();
-+		g_cp_test(mode >= 2);
++		g_cp_test(mode);
 +	} else {
 +		printf("SWEET GPUS: power-up failed, stopping\n");
 +	}
