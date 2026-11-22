@@ -9,13 +9,15 @@
  bsd/dev/sweet_usb.c			standard
 --- /dev/null
 +++ b/bsd/dev/sweet_gpu_a619.c
-@@ -0,0 +1,3979 @@
+@@ -0,0 +1,3984 @@
 +/*
 + * miami (Motorola Edge 30 Neo, SM6375): Adreno 619 (GMU-wrapper "holi", chipid 0x6010901) bring-up.
 + *
 + * Moved out of sweet_touch_gt9916.c. Boot-args:
 + *   sweetgpu=1       power up the GPU, authenticate the zap shader, start the CP and run the CP_MEM_WRITE self test
 + *   sweetgpu=2       the same, then run the A2D blit demo (a gradient square drawn on the panel, 300 frames)
++ *   sweetgpu=3       also: probe the client address range, and test fault recovery
++ *   sweetgpu=4       also: run the IOKit user client from inside the kernel (selftest in SweetGPUService.cpp)
 + *   sweetgpudebug=1  verbose log: print every register access and pause 100-1500 ms around the risky ones, so the
 + *                    last log line names the culprit if the phone hangs. Without it the run is quiet and fast.
 + *   sweetgpuprobe=16/17 are accepted as aliases for sweetgpu=1/2 (the old probe stages 1-15 are gone).
@@ -52,6 +54,7 @@
 + */
 +int sweet_gpu_submit(const uint32_t *cmds, unsigned n, uint32_t *seq);
 +int sweet_gpu_wait(uint32_t seq, unsigned timeout_ms);
++void sweet_gpu_service_selftest(void);	/* SweetGPUService.cpp: drives the IOKit user client from inside the kernel */
 +
 +static int g_dbg;           /* sweetgpudebug=1 */
 +static int g_sleep_chan;
@@ -3927,6 +3930,8 @@
 +	if (blit)
 +		g_blit_test();
 +	g_user_probes();
++	if (mode >= 4)
++		sweet_gpu_service_selftest();
 +	if (mode >= 3) {
 +		/* recovery test: a command stream at an address nothing maps faults the SMMU and wedges the CP */
 +		uint32_t fence = 0, seq = 0;

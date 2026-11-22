@@ -24,7 +24,7 @@
      "     'IOClass'         = IOPanicPlatform;"
 --- /dev/null
 +++ b/iokit/Kernel/arm/SweetGPUService.cpp
-@@ -0,0 +1,321 @@
+@@ -0,0 +1,413 @@
 +/*
 + * The Adreno 619 as an IOKit service. Boot-arg sweetgpu=1/2 brings the GPU up (bsd/dev/sweet_gpu_a619.c);
 + * with it SweetGPUService is published, and a userland process can open a user client on it
@@ -61,9 +61,12 @@
 +int sweet_gpu_map_user(uint64_t *iova_out, const uint64_t *pages, uint32_t npages, uint32_t page_size);
 +int sweet_gpu_submit_user(uint64_t ib_iova, uint32_t dwords, uint32_t timeout_ms, uint32_t *fence_out);
 +void flush_dcache64(addr64_t addr, unsigned count, int phys);
++void sweet_gpu_service_selftest(void);
 +}
 +
-+static IOLock *gSweetGPUMapLock;        /* the shared page list in addMemory() and the GPU VA allocation */
++static IOLock *gSweetGPUMapLock;
++class SweetGPUService;
++static SweetGPUService *gSweetGPUService;        /* the shared page list in addMemory() and the GPU VA allocation */
 +
 +class SweetGPUService : public IOService {
 +	OSDeclareDefaultStructors(SweetGPUService);
@@ -99,6 +102,7 @@
 +	if (gSweetGPUMapLock == NULL) {
 +		return false;
 +	}
++	gSweetGPUService = this;
 +	setProperty("model", "Adreno 619");
 +	setProperty(kIOUserClientClassKey, "SweetGPUUserClient");
 +	registerService();
@@ -344,5 +348,93 @@
 +	default:
 +		return kIOReturnUnsupported;
 +	}
++}
++/*
++ * In-kernel exercise of the user client, called from the GPU thread when the boot-arg is sweetgpu=4 or more:
++ * it opens a client on the service like a process would, and drives selectors 0, 1, 5, 4, 5 and 2 with a
++ * command stream that makes the GPU write a word into the buffer. Needs no userland binary.
++ */
++extern "C" void
++sweet_gpu_service_selftest(void)
++{
++	IOUserClient *client = NULL;
++	if (gSweetGPUService == NULL) {
++		IOLog("SWEET GPUT: service not published, no selftest\n");
++		return;
++	}
++	IOReturn r = gSweetGPUService->newUserClient(kernel_task, NULL, 0, &client);
++	if (r != kIOReturnSuccess || client == NULL) {
++		IOLog("SWEET GPUT: newUserClient failed 0x%x\n", r);
++		return;
++	}
++	IOExternalMethodArguments a;
++	uint64_t in[3] = { 0, 0, 0 }, out[3] = { 0, 0, 0 };
++	bzero(&a, sizeof(a));
++	a.scalarInput = in;
++	a.scalarOutput = out;
++
++	a.scalarInputCount = 0;
++	a.scalarOutputCount = 3;
++	r = client->externalMethod(0, &a, NULL, NULL, NULL);
++	IOLog("SWEET GPUT: info -> 0x%x gpu %llu chip 0x%llx ready %llu\n", r, out[0], out[1], out[2]);
++
++	in[0] = 0x20000;
++	a.scalarInputCount = 1;
++	a.scalarOutputCount = 3;
++	r = client->externalMethod(1, &a, NULL, NULL, NULL);
++	const uint64_t handle = out[0], va = out[1];
++	IOLog("SWEET GPUT: alloc 0x20000 -> 0x%x handle %llu gpu va 0x%llx size 0x%llx\n", r, handle, va, out[2]);
++	if (r != kIOReturnSuccess) {
++		client->clientClose();
++		client->release();
++		return;
++	}
++
++	IOOptionBits opts = 0;
++	IOMemoryDescriptor *md = NULL;
++	IOMemoryMap *map = NULL;
++	if (client->clientMemoryForType((UInt32)handle, &opts, &md) == kIOReturnSuccess && md != NULL) {
++		map = md->map();
++	}
++	if (map == NULL) {
++		IOLog("SWEET GPUT: could not map the buffer\n");
++	} else {
++		volatile uint32_t *p = (volatile uint32_t *)map->getVirtualAddress();
++		const uint64_t target = va + 0x1000 + 0x20;
++		p[0] = 0x703d8003u;		/* CP_MEM_WRITE, 3 dwords */
++		p[1] = (uint32_t)target;
++		p[2] = (uint32_t)(target >> 32);
++		p[3] = 0x5ca1ab1eu;
++		p[0x1000 / 4 + 8] = 0;
++
++		in[0] = handle; in[1] = 0; in[2] = 0x20000;
++		a.scalarInputCount = 3;
++		r = client->externalMethod(5, &a, NULL, NULL, NULL);
++		IOLog("SWEET GPUT: cache flush (before) -> 0x%x\n", r);
++
++		in[0] = va; in[1] = 4; in[2] = 500;
++		a.scalarInputCount = 3;
++		a.scalarOutputCount = 1;
++		r = client->externalMethod(4, &a, NULL, NULL, NULL);
++		IOLog("SWEET GPUT: submit -> 0x%x fence %llu\n", r, out[0]);
++
++		in[0] = handle; in[1] = 0; in[2] = 0x20000;
++		a.scalarInputCount = 3;
++		(void)client->externalMethod(5, &a, NULL, NULL, NULL);
++		uint32_t v = p[0x1000 / 4 + 8];
++		IOLog("SWEET GPUT: word the GPU wrote = 0x%08x -> %s\n", v, v == 0x5ca1ab1eu ? "USER CLIENT WORKS" : "not written");
++		map->release();
++	}
++	if (md != NULL) {
++		md->release();
++	}
++
++	in[0] = handle;
++	a.scalarInputCount = 1;
++	r = client->externalMethod(2, &a, NULL, NULL, NULL);
++	IOLog("SWEET GPUT: free -> 0x%x\n", r);
++	client->clientClose();
++	client->release();
++	IOLog("SWEET GPUT: selftest done\n");
 +}
 +#endif /* ARM64_BOARD_CONFIG_SWEET */
