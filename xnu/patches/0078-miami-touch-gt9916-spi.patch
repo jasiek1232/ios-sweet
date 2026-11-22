@@ -32,7 +32,7 @@
  		thread_deallocate(thread);
 --- /dev/null
 +++ b/bsd/dev/sweet_touch_gt9916.c
-@@ -0,0 +1,4730 @@
+@@ -0,0 +1,4745 @@
 +/*
 + * miami (Motorola Edge 30 Neo, SM6375): Goodix GT9916S touch over the GENI SPI engine.
 + *
@@ -846,7 +846,22 @@
 +static vm_offset_t
 +g_gpu_map(uint64_t pa)
 +{
-+	return ml_io_map((vm_offset_t)(pa & ~0xfffULL), 0x1000) + (vm_offset_t)(pa & 0xfffULL);
++	/* ml_io_map never frees and the I/O VA aperture is small: cache one mapping per PA page. */
++	static struct { uint64_t page; vm_offset_t va; } cache[64];
++	static unsigned ncache;
++	uint64_t page = pa & ~0xfffULL;
++	for (unsigned i = 0; i < ncache; i++)
++		if (cache[i].page == page)
++			return cache[i].va + (vm_offset_t)(pa & 0xfffULL);
++	vm_offset_t base = ml_io_map((vm_offset_t)page, 0x1000);
++	if (!base)
++		return 0;
++	if (ncache < 64) {
++		cache[ncache].page = page;
++		cache[ncache].va = base;
++		ncache++;
++	}
++	return base + (vm_offset_t)(pa & 0xfffULL);
 +}
 +
 +static int
