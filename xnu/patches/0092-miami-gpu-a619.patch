@@ -9,7 +9,7 @@
  bsd/dev/sweet_usb.c			standard
 --- /dev/null
 +++ b/bsd/dev/sweet_gpu_a619.c
-@@ -0,0 +1,3731 @@
+@@ -0,0 +1,3852 @@
 +/*
 + * miami (Motorola Edge 30 Neo, SM6375): Adreno 619 (GMU-wrapper "holi", chipid 0x6010901) bring-up.
 + *
@@ -1053,7 +1053,7 @@
 + * allocations mapped at an IOVA: dynamic IOVAs come from a bump allocator starting at G_IOVA_ARENA, fixed
 + * IOVAs are for the A2D blit demo whose command stream has its addresses baked in. Nothing is ever freed yet.
 + */
-+#define G_PT_PAGES	64u		/* 4 KiB table pages in the pool (256 KiB) */
++#define G_PT_PAGES	512u		/* 4 KiB table pages in the pool (2 MiB) */
 +#define G_IOVA_ARENA	0x00100000ull	/* dynamic allocations start here; below is the fixed demo layout */
 +#define G_IOVA_END	0x04000000ull	/* the panel framebuffer blocks live at this IOVA */
 +#define G_PTE_PAGE_WB	0x743ull	/* valid page, attr0 (write-back), inner shareable, AF */
@@ -1148,7 +1148,7 @@
 +static void
 +g_as_sync(void)
 +{
-+	flush_dcache64((addr64_t)gp.pt_pa, G_PT_PAGES * 0x1000u, TRUE);
++	flush_dcache64((addr64_t)gp.pt_pa, ((gp.pt_used * 0x1000u) + PAGE_MASK) & ~(unsigned)PAGE_MASK, TRUE);
 +	__asm__ volatile ("dsb sy" ::: "memory");
 +}
 +
@@ -3446,6 +3446,96 @@
 +	return -1;
 +}
 +
++/* ---- buffers and submissions for the IOKit user client (iokit/Kernel/arm/SweetGPUService.cpp) ---- */
++
++#define G_USER_VA_BASE	0x200000000ull	/* above everything the kernel itself maps */
++#define G_USER_VA_END	0x7f00000000ull
++#define G_USER_VA_ALIGN	0x10000ull
++
++static uint64_t g_user_next = G_USER_VA_BASE;
++
++bool sweet_gpu_ready(void);
++int sweet_gpu_map_user(uint64_t *iova_out, const uint64_t *pages, uint32_t npages, uint32_t page_size);
++int sweet_gpu_submit_user(uint64_t ib_iova, uint32_t dwords, uint32_t timeout_ms, uint32_t *fence_out);
++
++bool
++sweet_gpu_ready(void)
++{
++	return svc.ready != 0;
++}
++
++/* invalidate the context bank's TLB (TLBIALL, then TLBSYNC and poll TLBSTATUS.GSACTIVE) */
++static void
++g_tlb_flush(void)
++{
++	vm_offset_t cb = g_gpu_map(0x05948000ull);
++	if (!cb)
++		return;
++	*(volatile uint32_t *)(cb + 0x618) = 0;
++	__asm__ volatile ("dsb sy" ::: "memory");
++	*(volatile uint32_t *)(cb + 0x7f0) = 0;
++	__asm__ volatile ("dsb sy" ::: "memory");
++	for (int i = 0; i < 10000; i++)
++		if (!(*(volatile uint32_t *)(cb + 0x7f4) & 1u))
++			break;
++}
++
++/*
++ * Map physical pages at a fresh GPU address. The VA is never reused yet: freed buffers leak their VA and
++ * their table pages. The caller has already cleaned the CPU caches (the GPU does not snoop).
++ */
++int
++sweet_gpu_map_user(uint64_t *iova_out, const uint64_t *pages, uint32_t npages, uint32_t page_size)
++{
++	if (!svc.ready || npages == 0 || (page_size & 0xfffu))
++		return -1;
++	uint64_t size = (uint64_t)npages * page_size;
++	lck_mtx_lock(&g_svc_lock);
++	uint64_t iova = g_user_next;
++	if (iova + size > G_USER_VA_END) {
++		lck_mtx_unlock(&g_svc_lock);
++		return -1;
++	}
++	for (uint32_t i = 0; i < npages; i++) {
++		if (!g_as_map(iova + (uint64_t)i * page_size, pages[i], page_size, G_PTE_PAGE_WB)) {
++			lck_mtx_unlock(&g_svc_lock);
++			return -1;
++		}
++	}
++	g_user_next = (iova + size + G_USER_VA_ALIGN - 1) & ~(G_USER_VA_ALIGN - 1);
++	g_as_sync();
++	g_tlb_flush();
++	lck_mtx_unlock(&g_svc_lock);
++	*iova_out = iova;
++	return 0;
++}
++
++/* Run an indirect buffer (user GPU memory) and wait for it: 0, or -1 on a hang or fault (the fault is cleared). */
++int
++sweet_gpu_submit_user(uint64_t ib_iova, uint32_t dwords, uint32_t timeout_ms, uint32_t *fence_out)
++{
++	const uint32_t pkt[4] = { G_PKT7(0x3f, 3), (uint32_t)ib_iova, (uint32_t)(ib_iova >> 32), dwords };
++	uint32_t seq = 0;
++	*fence_out = 0;
++	if (sweet_gpu_submit(pkt, 4, &seq) != 0)
++		return -1;
++	int rc = sweet_gpu_wait(seq, timeout_ms ? timeout_ms : 1000);
++	*fence_out = seq;
++	if (rc) {
++		vm_offset_t cb = g_gpu_map(0x05948000ull);
++		if (cb) {
++			uint32_t fsr = *(volatile uint32_t *)(cb + 0x58);
++			uint64_t far = *(volatile uint32_t *)(cb + 0x60) | ((uint64_t)*(volatile uint32_t *)(cb + 0x64) << 32);
++			uint32_t syn = *(volatile uint32_t *)(cb + 0x68);
++			printf("SWEET GPUQ: user IB %llx (%u dwords) timed out: smmu fsr 0x%x far 0x%llx fsynr0 0x%x\n",
++			    (unsigned long long)ib_iova, dwords, fsr, (unsigned long long)far, syn);
++			*(volatile uint32_t *)(cb + 0x58) = fsr;	/* a fault stops the GPU's writes until FSR is cleared */
++			__asm__ volatile ("dsb sy" ::: "memory");
++		}
++	}
++	return rc;
++}
++
 +/*
 + * stage 17: a real graphics operation. The A6xx 2D engine (CP_BLIT, op SCALE) scales a 128x128 gradient
 + * texture to 384x384 with bilinear filtering into a pitch-aligned GPU buffer, the same stream Mesa's turnip
@@ -3689,6 +3779,37 @@
 +				ok++;
 +		printf("SWEET GPUQ: %u submissions queued, wait %s, %u of %u results correct, last seq %u\n", queued,
 +		    wr == 0 ? "ok" : "TIMED OUT", ok, queued, seq);
++	}
++	{
++		/* the same path the IOKit user client takes: map pages above 4 GiB, run an indirect buffer that writes into them */
++		vm_offset_t um = 0;
++		uint64_t uiova = 0, upages[2];
++		uint32_t fence = 0;
++		unsigned okc = 0;
++		if (kmem_alloc_contig(kernel_map, &um, 2 * PAGE_SIZE, PAGE_MASK, 0, 0,
++		    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) == KERN_SUCCESS) {
++			uint64_t upa = ptoa_64(pmap_find_phys(kernel_pmap, (addr64_t)um));
++			upages[0] = upa;
++			upages[1] = upa + PAGE_SIZE;
++			int mr = sweet_gpu_map_user(&uiova, upages, 2, PAGE_SIZE);
++			if (mr == 0) {
++				const uint64_t target = uiova + PAGE_SIZE + 0x10;
++				volatile uint32_t *ib = (volatile uint32_t *)um;
++				ib[0] = G_PKT7(0x3d, 3);
++				ib[1] = (uint32_t)target;
++				ib[2] = (uint32_t)(target >> 32);
++				ib[3] = 0xfeedf00du;
++				flush_dcache64((addr64_t)upa, 2 * PAGE_SIZE, TRUE);
++				int sr = sweet_gpu_submit_user(uiova, 4, 500, &fence);
++				flush_dcache64((addr64_t)upa, 2 * PAGE_SIZE, TRUE);
++				uint32_t v = *(volatile uint32_t *)(um + PAGE_SIZE + 0x10);
++				okc = (sr == 0 && v == 0xfeedf00du);
++				printf("SWEET GPUQ: user IB test: map at IOVA 0x%llx, submit %s, word 0x%08x -> %s\n",
++				    (unsigned long long)uiova, sr == 0 ? "ok" : "FAILED", v, okc ? "USER PATH WORKS" : "not written");
++			} else {
++				printf("SWEET GPUQ: user IB test: map failed\n");
++			}
++		}
 +	}
 +	if (blit)
 +		g_blit_test();
