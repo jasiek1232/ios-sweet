@@ -236,6 +236,45 @@ jobs:
           cp ../bridge-out/libnative_metal_bridge.a work/m2v-bridge/ios/
           brew install glslang
 
+      - name: m2vtest memory watcher (diagnostic)
+        run: |
+          cd flame
+          python3 - <<'PY'
+          p = 'phone/metal2/m2vtest.c'
+          s = open(p).read()
+          s = s.replace('#include <unistd.h>\n', """#include <unistd.h>
+          #include <pthread.h>
+          #include <mach/mach.h>
+          extern int memorystatus_control(uint32_t, int32_t, uint32_t, void *, size_t);
+          struct mlp { int32_t a; uint32_t aa; int32_t i; uint32_t ia; };
+          static void *memwatch(void *x)
+          {
+          	uint64_t last = 0;
+          	(void)x;
+          	for (;;) {
+          		task_vm_info_data_t v;
+          		mach_msg_type_number_t c = TASK_VM_INFO_COUNT;
+          		if (task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&v, &c) == KERN_SUCCESS) {
+          			uint64_t f = v.phys_footprint >> 20;
+          			if (last == 0 || f >= last + 32 || f + 32 <= last) {
+          				struct mlp m = { 0 };
+          				int r = memorystatus_control(8, getpid(), 0, &m, sizeof m);
+          				printf("MEM footprint %llu MB virtual %llu MB limit active %d attr %u inactive %d attr %u ret %d\\n",
+          				       (unsigned long long)f, (unsigned long long)(v.virtual_size >> 20), m.a, m.aa, m.i, m.ia, r);
+          				fflush(stdout);
+          				last = f ? f : 1;
+          			}
+          		}
+          		usleep(20000);
+          	}
+          	return NULL;
+          }
+          """, 1)
+          s = s.replace('\tstruct NmbSelftest out = { 0 };\n', '\tstruct NmbSelftest out = { 0 };\n\t{ pthread_t th; pthread_create(&th, NULL, memwatch, NULL); }\n', 1)
+          assert 'memwatch(NULL)' not in s and 'pthread_create' in s and 'static void *memwatch' in s
+          open(p, 'w').write(s)
+          PY
+
       - name: SweetMetal2 bundle
         run: |
           cd flame
