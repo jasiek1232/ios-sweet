@@ -11,7 +11,7 @@
 # tools/sweet-root-tweaks.py wants it, and adds
 #   /private/var/local/bin/vktest, /private/var/local/lib/libvulkan_freedreno.dylib
 #   (+ m2vtest and SweetMetal2.bundle in /private/var/local/metal2/, not used yet)
-#   a launchd job org.sweet.vktest: runs vktest 90 s after boot and then every 90 s, stdout and stderr on the
+#   a launchd job org.sweet.vktest: runs vktest once, 150 s after boot (m2vtest once, 480 s after boot), stdout and stderr on the
 #   console, environment TU_DARWIN_SERVICE=SweetGPUService TU_DARWIN_OPEN_TYPE=0x4147 (Turnip's darwin backend
 #   otherwise looks for IOAcceleratorES). Boot with sweetgpu=5 or more so that the service exists.
 # Afterwards the copy is what the phone holds: keep it as the OLD of the next run.
@@ -63,7 +63,9 @@ plist['LaunchDaemons'][key] = {
     'Label': 'org.sweet.vktest',
     'ProgramArguments': ['/private/var/local/bin/vktest', '/private/var/local/lib/libvulkan_freedreno.dylib'],
     'EnvironmentVariables': {'TU_DARWIN_SERVICE': 'SweetGPUService', 'TU_DARWIN_OPEN_TYPE': '0x4147'},
-    'StartInterval': 90,
+    'StartInterval': 150,
+    'LaunchOnlyOnce': True,
+    'JetsamProperties': {'JetsamMemoryLimit': 2048},
     'RunAtLoad': False,
     'UserName': 'root',
     'StandardOutPath': '/dev/console',
@@ -76,7 +78,9 @@ if os.path.exists(os.path.join(os.path.dirname(os.environ['M2V']), 'm2vtest')):
         'ProgramArguments': ['/private/var/local/metal2/m2vtest', '/private/var/local/lib/libvulkan_freedreno.dylib',
                              '/private/var/local/m2v-cache'],
         'EnvironmentVariables': {'TU_DARWIN_SERVICE': 'SweetGPUService', 'TU_DARWIN_OPEN_TYPE': '0x4147'},
-        'StartInterval': 150,
+        'StartInterval': 480,
+        'LaunchOnlyOnce': True,
+        'JetsamProperties': {'JetsamMemoryLimit': 3072},
         'RunAtLoad': False,
         'UserName': 'root',
         'StandardOutPath': '/dev/console',
