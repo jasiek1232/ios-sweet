@@ -5,7 +5,7 @@
 #
 # OLD.img  the image that is on the phone's userdata partition right now (never modified here)
 # the tar  the "metal-userland" artifact of the GitHub workflow "metal"
-# OUT.simg a sparse image with only the changed blocks: fastboot flash userdata OUT.simg
+# OUT.simg a sparse image (or - for none; use - : this bootloader refuses userdata writes, flash the whole NEW via adb) with only the changed blocks: fastboot flash userdata OUT.simg
 #
 # It works on a copy of OLD (16 GiB sparse: check `df -h` first), mounted read-write the way
 # tools/sweet-root-tweaks.py wants it, and adds
@@ -52,7 +52,7 @@ if [[ -d $stage/SweetMetal2.bundle ]]; then
 fi
 
 echo "== launchd job"
-python3 - "$mnt/System/Library/xpc/launchd.plist" <<'PY'
+M2V="$mnt/private/var/local/metal2/m2vtest" python3 - "$mnt/System/Library/xpc/launchd.plist" <<'PY'
 import os, plistlib, sys
 path = sys.argv[1]
 st = os.stat(path)
@@ -69,6 +69,20 @@ plist['LaunchDaemons'][key] = {
     'StandardOutPath': '/dev/console',
     'StandardErrorPath': '/dev/console',
 }
+if os.path.exists(os.path.join(os.path.dirname(os.environ['M2V']), 'm2vtest')):
+    key2 = '/System/Library/LaunchDaemons/org.sweet.m2vtest.plist'
+    plist['LaunchDaemons'][key2] = {
+        'Label': 'org.sweet.m2vtest',
+        'ProgramArguments': ['/private/var/local/metal2/m2vtest', '/private/var/local/lib/libvulkan_freedreno.dylib',
+                             '/private/var/local/m2v-cache'],
+        'EnvironmentVariables': {'TU_DARWIN_SERVICE': 'SweetGPUService', 'TU_DARWIN_OPEN_TYPE': '0x4147'},
+        'StartInterval': 150,
+        'RunAtLoad': False,
+        'UserName': 'root',
+        'StandardOutPath': '/dev/console',
+        'StandardErrorPath': '/dev/console',
+    }
+    print('org.sweet.m2vtest added')
 with open(path, 'wb') as f:
     plistlib.dump(plist, f, fmt=plistlib.FMT_BINARY)
 os.chown(path, st.st_uid, st.st_gid)
@@ -78,9 +92,12 @@ PY
 
 sync
 umount "$mnt"
-echo "== sparse image"
-python3 "$here/sparsediff.py" "$old" "$new" "$out"
-ls -la "$out"
+if [[ $out != - ]]; then
+	echo "== sparse image"
+	python3 "$here/sparsediff.py" "$old" "$new" "$out"
+	ls -la "$out"
+fi
 echo
-echo "flash:  fastboot -S 512M flash userdata $out"
+echo "Flash the whole $new (recovery + adb push to /dev/block/by-name/userdata, then compare sha256sum)."
+echo "A diff ($out) is only valid while the phone has NOT booted since its last full flash."
 echo "from now on the phone's image is $new (use it as OLD next time)"
