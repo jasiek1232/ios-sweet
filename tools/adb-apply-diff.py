@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""Apply the differences between OLD.img and NEW.img to the phone's userdata
+"""NOTE: a diff is only valid against the exact image last flashed AND never booted
+(iOS writes to the volume on every boot). After a boot use --full.
+
+Apply the differences between OLD.img and NEW.img to the phone's userdata
 partition over adb (OrangeFox/Lineage recovery), without fastboot.
 
   adb-apply-diff.py OLD.img NEW.img [--dev /dev/block/sda34] [--dry-run] [--no-verify]
@@ -20,8 +23,10 @@ def adb(*a, **k):
     return subprocess.run(['adb', *a], check=True, **k)
 
 
-def runs(old, new):
+def runs(old, new, full=False):
     size = os.path.getsize(new)
+    if full:
+        return [[0, size // BS]]
     if os.path.getsize(old) != size or size % BS:
         sys.exit('images must have the same size, a multiple of 4096')
     out, cur = [], None
@@ -48,8 +53,10 @@ def main():
     ap.add_argument('--dev', default='/dev/block/sda34')
     ap.add_argument('--dry-run', action='store_true')
     ap.add_argument('--no-verify', action='store_true')
+    ap.add_argument('--full', action='store_true',
+                    help='write every block of NEW (OLD is ignored; pass NEW twice)')
     a = ap.parse_args()
-    rs = runs(a.old, a.new)
+    rs = runs(a.old, a.new, a.full)
     pieces = []
     for s, e in rs:
         while s < e:
