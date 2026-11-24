@@ -1,0 +1,43 @@
+diff --git a/iokit/Kernel/arm/SweetGPUService.cpp b/iokit/Kernel/arm/SweetGPUService.cpp
+index 0f38136..d1f795c 100644
+--- a/iokit/Kernel/arm/SweetGPUService.cpp
++++ b/iokit/Kernel/arm/SweetGPUService.cpp
+@@ -155,6 +155,29 @@ public:
+ 
+ OSDefineMetaClassAndStructors(SweetGPUUserClient, IOUserClient);
+ 
++/*
++ * Metal opens the accelerator as soon as backboardd starts, which can be long before the GPU thread has brought the
++ * GPU up (sweetgpu=5 waits 20 s first). Turnip does not retry, so a refused open means no Metal device for the whole
++ * boot: wait here, up to 3 minutes, until the GPU is ready. The in-kernel self-test (kernel_task) never waits.
++ */
++static int
++sweet_v2_wait_window(uint64_t *base, uint64_t *size, task_t task)
++{
++	for (int i = 0; i < 1800; i++) {
++		if (sweet_gpu_window_alloc(base, size) == 0) {
++			if (i) {
++				IOLog("SWEET GPU: v2 client waited %d ms for the GPU\n", i * 100);
++			}
++			return 0;
++		}
++		if (task == kernel_task) {
++			break;
++		}
++		IOSleep(100);
++	}
++	return -1;
++}
++
+ bool
+ SweetGPUUserClient::initWithTask(task_t owningTask, void *securityID, UInt32 type)
+ {
+@@ -172,7 +195,7 @@ SweetGPUUserClient::initWithTask(task_t owningTask, void *securityID, UInt32 typ
+ 		fBOCap = 256;
+ 		fBO = IONewZero(SweetV2BO, fBOCap);
+ 		fPageBuf = IONew(uint64_t, SWEET_V2_PAGEBUF);
+-		if (fBO == NULL || fPageBuf == NULL || sweet_gpu_window_alloc(&fWinBase, &fWinSize)) {
++		if (fBO == NULL || fPageBuf == NULL || sweet_v2_wait_window(&fWinBase, &fWinSize, owningTask)) {
+ 			IOLog("SWEET GPU: v2 client: no GPU window\n");
+ 			return false;
+ 		}
