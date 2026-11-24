@@ -10,7 +10,8 @@
 # It works on a copy of OLD (16 GiB sparse: check `df -h` first), mounted read-write the way
 # tools/sweet-root-tweaks.py wants it, and adds
 #   /private/var/local/bin/vktest, /private/var/local/lib/libvulkan_freedreno.dylib
-#   (+ m2vtest and SweetMetal2.bundle in /private/var/local/metal2/, not used yet)
+#   (+ m2vtest in /private/var/local/metal2/, SweetMetal2.bundle in /System/Library/Extensions (used with boot-arg
+#   sweetmtl=2), /private/var/local/{mtl2.log,mtl2-clients,m2v-cache})
 #   a launchd job org.sweet.vktest: runs vktest once, 150 s after boot (m2vtest once, 480 s after boot), stdout and stderr on the
 #   console, environment TU_DARWIN_SERVICE=SweetGPUService TU_DARWIN_OPEN_TYPE=0x4147 (Turnip's darwin backend
 #   otherwise looks for IOAcceleratorES). Boot with sweetgpu=5 or more so that the service exists.
@@ -49,6 +50,16 @@ if [[ -d $stage/SweetMetal2.bundle ]]; then
 	cp -a "$stage/SweetMetal2.bundle" "$mnt/private/var/local/metal2/"
 	[[ ! -s $stage/m2vtest ]] || install -o 0 -g 0 -m 755 "$stage/m2vtest" "$mnt/private/var/local/metal2/m2vtest"
 	chown -R 0:0 "$mnt/private/var/local/metal2"
+	# Metal for backboardd (boot with sweetmtl=2 and a kernel with patches 0096/0097): Metal.framework loads the plugin
+	# named by the accelerator's MetalPluginName from /System/Library/Extensions; SweetMetal2 reads these files.
+	install -d -o 0 -g 0 -m 755 "$mnt/System/Library/Extensions"
+	rm -rf "$mnt/System/Library/Extensions/SweetMetal2.bundle"
+	cp -a "$stage/SweetMetal2.bundle" "$mnt/System/Library/Extensions/"
+	chown -R 0:0 "$mnt/System/Library/Extensions/SweetMetal2.bundle"
+	install -o 0 -g 0 -m 666 /dev/null "$mnt/private/var/local/mtl2.log"
+	printf 'SpringBoard\n' > "$mnt/private/var/local/mtl2-clients"
+	chown 0:0 "$mnt/private/var/local/mtl2-clients"; chmod 644 "$mnt/private/var/local/mtl2-clients"
+	install -d -o 0 -g 0 -m 777 "$mnt/private/var/local/m2v-cache"
 fi
 
 echo "== launchd job"
@@ -77,7 +88,7 @@ if os.path.exists(os.path.join(os.path.dirname(os.environ['M2V']), 'm2vtest')):
         'Label': 'org.sweet.m2vtest',
         'ProgramArguments': ['/private/var/local/metal2/m2vtest', '/private/var/local/lib/libvulkan_freedreno.dylib',
                              '/private/var/local/m2v-cache'],
-        'EnvironmentVariables': {'TU_DARWIN_SERVICE': 'SweetGPUService', 'TU_DARWIN_OPEN_TYPE': '0x4147'},
+        'EnvironmentVariables': {'TU_DARWIN_SERVICE': 'SweetGPUService', 'TU_DARWIN_OPEN_TYPE': '0x4147', 'NMB_LIST': '1'},
         'StartInterval': 480,
         'LaunchOnlyOnce': True,
         'JetsamProperties': {'JetsamMemoryLimit': 3072},
