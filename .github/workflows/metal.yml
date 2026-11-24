@@ -244,6 +244,7 @@ jobs:
           s = open(p).read()
           s = s.replace('#include <unistd.h>\n', """#include <unistd.h>
           #include <pthread.h>
+          #include <errno.h>
           #include <mach/mach.h>
           extern int memorystatus_control(uint32_t, int32_t, uint32_t, void *, size_t);
           struct mlp { int32_t a; uint32_t aa; int32_t i; uint32_t ia; };
@@ -256,7 +257,7 @@ jobs:
           		mach_msg_type_number_t c = TASK_VM_INFO_COUNT;
           		if (task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&v, &c) == KERN_SUCCESS) {
           			uint64_t f = v.phys_footprint >> 20;
-          			if (last == 0 || f >= last + 32 || f + 32 <= last) {
+          			if (last == 0 || f >= last + 16 || f + 16 <= last) {
           				struct mlp m = { 0 };
           				int r = memorystatus_control(8, getpid(), 0, &m, sizeof m);
           				printf("MEM footprint %llu MB virtual %llu MB limit active %d attr %u inactive %d attr %u ret %d\\n",
@@ -271,6 +272,16 @@ jobs:
           }
           """, 1)
           s = s.replace('\tstruct NmbSelftest out = { 0 };\n', '\tstruct NmbSelftest out = { 0 };\n\t{ pthread_t th; pthread_create(&th, NULL, memwatch, NULL); }\n', 1)
+          s = s.replace('\tmkdir(cache, 0777);\n', """\tmkdir(cache, 0777);
+          \t{
+          \t\t/* launchd gives this daemon a fatal 6 MB limit and ignores JetsamMemoryLimit: raise it ourselves (we are root) */
+          \t\tstruct mlp lim = { 3072, 0, 3072, 0 };
+          \t\tint sr = memorystatus_control(7, getpid(), 0, &lim, sizeof lim);
+          \t\tprintf("set memlimit 3072 MB (non-fatal): ret %d errno %d\\n", sr, sr ? errno : 0);
+          \t\tfflush(stdout);
+          \t}
+          """, 1)
+          assert 'set memlimit' in s
           assert 'memwatch(NULL)' not in s and 'pthread_create' in s and 'static void *memwatch' in s
           open(p, 'w').write(s)
           PY
