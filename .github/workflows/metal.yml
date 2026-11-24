@@ -1,0 +1,312 @@
+name: metal
+
+# Builds the userland half of Metal-on-Adreno: Mesa Turnip (darwin kernel backend), the metal2vulkan bridge and the
+# SweetMetal2 bundle, for iOS 16 arm64. Stage 1: sources are taken unchanged from ios-flame (MIT, pinned commit), which
+# runs the same stack on an Adreno 640. Our own changes for the Adreno 619 come later as patches on top.
+# Output: artifact "metal-userland" (SweetMetal2.bundle, vktest, libvulkan_freedreno.dylib, m2vtest).
+
+on:
+  workflow_dispatch:
+    inputs:
+      flame_sha:
+        description: ios-flame commit to take the userland sources from
+        default: 745c4341af86089efb0df851fa8a27fb8face624
+      unixnu_ref:
+        description: UniXNU ref that the Mesa patches (patches/mesa) come from
+        default: main
+  push:
+    branches: [metal]
+    paths:
+      - ".github/workflows/metal.yml"
+      - "phone/**"
+
+concurrency:
+  group: metal-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  FLAME_REPO: https://github.com/NWylynko/ios-flame
+  FLAME_SHA: ${{ inputs.flame_sha || '745c4341af86089efb0df851fa8a27fb8face624' }}
+  UNIXNU_REPO: https://github.com/UniXNU/UniXNU
+  UNIXNU_REF: ${{ inputs.unixnu_ref || 'main' }}
+  MESA_SHA: 85fda3b36405bcaea8bffc64aa4f2651dc90770d
+  M2V_SHA: 720ef1ce
+  RUST_VERSION: 1.98.0
+
+jobs:
+  turnip:
+    runs-on: macos-15
+    timeout-minutes: 90
+    steps:
+      - name: Fetch ios-flame sources
+        run: |
+          git init -q flame
+          git -C flame fetch -q --depth 1 "$FLAME_REPO" "$FLAME_SHA"
+          git -C flame checkout -q FETCH_HEAD
+          git -C flame log -1 --format='ios-flame %h %s'
+
+      - name: Deps
+        run: |
+          brew install ninja bison flex glslang
+          cd flame
+          mkdir -p work/turnip
+          python3 -m venv work/turnip/venv
+          work/turnip/venv/bin/pip install -q meson mako pyyaml packaging ply
+
+      - name: Fetch Mesa
+        run: |
+          cd flame/work/turnip
+          git init -q mesa
+          cd mesa
+          # gitlab first, Chromium's mirror as the fallback
+          git fetch -q --depth 1 https://gitlab.freedesktop.org/mesa/mesa "$MESA_SHA" ||
+            git fetch -q --depth 1 https://chromium.googlesource.com/external/gitlab.freedesktop.org/mesa/mesa "$MESA_SHA"
+          git checkout -q FETCH_HEAD
+          git log -1 --format='mesa %h %s'
+
+      - name: Fetch UniXNU's Mesa patches
+        run: |
+          git clone -q --depth 1 --filter=blob:none --sparse --branch "$UNIXNU_REF" "$UNIXNU_REPO" unixnu
+          git -C unixnu sparse-checkout set patches/mesa
+          git -C unixnu log -1 --format='UniXNU %h %s'
+
+      - name: Apply Mesa patches
+        run: |
+          cd flame/work/turnip/mesa
+          # the eight patches ios-flame builds with, in UniXNU's order (scripts/data/adreno-compiler-inputs.json)
+          for p in freedreno-tools-nir ir3-darwin-build-id ir3-portable-asm-roundtrip offline-adreno-compiler-probe \
+                   turnip-darwin-kmd turnip-graphics-cache-feedback turnip-empty-scissor turnip-builtin-shader-pack; do
+            f=$GITHUB_WORKSPACE/unixnu/patches/mesa/$p.patch
+            echo "== $p"
+            git apply --check "$f" || { echo "::error::$p does not apply"; exit 1; }
+            git apply "$f"
+          done
+          # ios-flame's own Turnip change (optional: skipped with a warning if it no longer applies)
+          f=../../../phone/turnip/patches/0100-sweet-fetch-gmem-min-draws.patch
+          if git apply --check "$f" 2>/dev/null; then git apply "$f"; echo "== 0100 applied"; else echo "::warning::0100-sweet-fetch-gmem-min-draws does not apply"; fi
+
+      - name: Expose Apple's full libc headers
+        run: |
+          # ir3_lexer.c (flex output) sets _POSIX_C_SOURCE, which makes the iOS 18 SDK hide BYTE_ORDER, Dl_info and
+          # friends from u_endian.h / disk_cache.h. -D_DARWIN_C_SOURCE turns them back on for every file.
+          cd flame
+          python3 - <<'PY'
+          p = 'tools/build-turnip-ios.sh'
+          s = open(p).read()
+          a = "-fstack-protector-strong'\"\n"
+          assert s.count(a) == 1, 'cross-file flags line not found'
+          open(p, 'w').write(s.replace(a, "-fstack-protector-strong', '-D_DARWIN_C_SOURCE'\"\n"))
+          PY
+          grep -n "D_DARWIN_C_SOURCE" tools/build-turnip-ios.sh
+
+      - name: Match the ABI header to UniXNU's current Turnip backend
+        run: |
+          # UniXNU's main branch is newer than the ios-flame commit: tu_knl_darwin.cc tests a params flag that
+          # flame's NativeAdrenoABI.h (v1) lacks. The kernel never sets it (our BOs are write-combined), so the
+          # new name only has to exist. Value 2 is the next free bit after HostImport.
+          cd flame
+          python3 - <<'PY'
+          p = 'phone/turnip/NativeAdrenoABI.h'
+          s = open(p).read()
+          a = "    NativeAdrenoParamsHostImport = 1  /*"
+          assert s.count(a) == 1, 'params flag enum not found'
+          s = s.replace(a, "    NativeAdrenoParamsOwnedCoherent = 2, /* newer backends: BOs are IO-coherent (never set by our kernel) */\n    NativeAdrenoParamsHostImport = 1  /*")
+          open(p, 'w').write(s)
+          PY
+          grep -n "OwnedCoherent" phone/turnip/NativeAdrenoABI.h
+
+      - name: Build Turnip for iOS 16
+        run: |
+          cd flame
+          tools/build-turnip-ios.sh ios
+
+      - name: Why did the build fail?
+        if: failure()
+        run: |
+          cd flame/work/turnip
+          echo "---- first failing command and its output"
+          awk '/^FAILED/{n++} n==1' build-ios.log | head -c 6000
+          echo; echo "---- endian / dladdr settings meson saw"
+          grep -n -i "endian\|DLADDR\|DLFCN" configure-ios.log | head -20
+          grep -rn "UTIL_ARCH_LITTLE_ENDIAN" build-ios/build.ninja | head -3 | cut -c1-300
+          echo "---- lexer rule"
+          grep -n -B1 -A6 "ir3_lexer.c.o:" build-ios/build.ninja | cut -c1-1500 | head -30
+
+      - name: Collect
+        run: |
+          mkdir -p out
+          cp flame/work/turnip/build-ios/src/freedreno/vulkan/libvulkan_freedreno.dylib out/
+          cp -R flame/work/turnip/mesa/include out/mesa-include
+          lipo -info out/libvulkan_freedreno.dylib
+          vtool -show-build out/libvulkan_freedreno.dylib | head -8
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: turnip-ios
+          path: out/
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: turnip-logs
+          path: |
+            flame/work/turnip/configure-ios.log
+            flame/work/turnip/build-ios.log
+          if-no-files-found: ignore
+
+  bridge:
+    runs-on: macos-15
+    timeout-minutes: 90
+    steps:
+      - name: Fetch ios-flame sources
+        run: |
+          git init -q flame
+          git -C flame fetch -q --depth 1 "$FLAME_REPO" "$FLAME_SHA"
+          git -C flame checkout -q FETCH_HEAD
+
+      - name: Toolchain
+        run: |
+          brew install llvm
+          rustup toolchain install "$RUST_VERSION" --profile minimal -t aarch64-apple-ios
+          cargo +"$RUST_VERSION" --version
+
+      - name: Fetch metal2vulkan and apply patches
+        run: |
+          cd flame
+          mkdir -p work
+          # full clone: GitHub will not serve an abbreviated hash through a shallow fetch
+          git clone -q https://github.com/steelbrain/metal2vulkan work/metal2vulkan
+          cd work/metal2vulkan
+          git checkout -q "$M2V_SHA"
+          git log -1 --format='metal2vulkan %h %s'
+          for f in ../../phone/metal2/bridge/patches/*.patch; do
+            echo "== $f"
+            git apply --check "$f" || { echo "::error::$f does not apply"; exit 1; }
+            git apply "$f"
+          done
+
+      - name: Build the bridge for iOS 16
+        run: |
+          cd flame
+          tools/build-m2v-bridge.sh ios
+
+      - name: Check
+        run: |
+          cd flame/work/m2v-bridge/ios
+          ls -la libnative_metal_bridge.a
+          nm -m libnative_metal_bridge.a 2>/dev/null | grep "weak external" | head -20 || true
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bridge-ios
+          path: flame/work/m2v-bridge/ios/libnative_metal_bridge.a
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: bridge-logs
+          path: flame/work/m2v-bridge/build-ios.log
+          if-no-files-found: ignore
+
+  bundle:
+    needs: [turnip, bridge]
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - name: Fetch ios-flame sources
+        run: |
+          git init -q flame
+          git -C flame fetch -q --depth 1 "$FLAME_REPO" "$FLAME_SHA"
+          git -C flame checkout -q FETCH_HEAD
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: turnip-ios
+          path: turnip-out
+      - uses: actions/download-artifact@v4
+        with:
+          name: bridge-ios
+          path: bridge-out
+
+      - name: Place the build outputs where ios-flame's scripts expect them
+        run: |
+          cd flame
+          T=work/turnip
+          mkdir -p $T/build-ios/src/freedreno/vulkan work/m2v-bridge/ios $T/mesa
+          cp ../turnip-out/libvulkan_freedreno.dylib $T/build-ios/src/freedreno/vulkan/
+          cp -R ../turnip-out/mesa-include $T/mesa/include
+          cp ../bridge-out/libnative_metal_bridge.a work/m2v-bridge/ios/
+          brew install glslang
+
+      - name: m2vtest memory watcher (diagnostic)
+        run: |
+          cd flame
+          python3 - <<'PY'
+          p = 'phone/metal2/m2vtest.c'
+          s = open(p).read()
+          s = s.replace('#include <unistd.h>\n', """#include <unistd.h>
+          #include <pthread.h>
+          #include <errno.h>
+          #include <mach/mach.h>
+          extern int memorystatus_control(uint32_t, int32_t, uint32_t, void *, size_t);
+          struct mlp { int32_t a; uint32_t aa; int32_t i; uint32_t ia; };
+          static void *memwatch(void *x)
+          {
+          	uint64_t last = 0;
+          	(void)x;
+          	for (;;) {
+          		task_vm_info_data_t v;
+          		mach_msg_type_number_t c = TASK_VM_INFO_COUNT;
+          		if (task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&v, &c) == KERN_SUCCESS) {
+          			uint64_t f = v.phys_footprint >> 20;
+          			if (last == 0 || f >= last + 16 || f + 16 <= last) {
+          				struct mlp m = { 0 };
+          				int r = memorystatus_control(8, getpid(), 0, &m, sizeof m);
+          				printf("MEM footprint %llu MB virtual %llu MB limit active %d attr %u inactive %d attr %u ret %d\\n",
+          				       (unsigned long long)f, (unsigned long long)(v.virtual_size >> 20), m.a, m.aa, m.i, m.ia, r);
+          				fflush(stdout);
+          				last = f ? f : 1;
+          			}
+          		}
+          		usleep(20000);
+          	}
+          	return NULL;
+          }
+          """, 1)
+          s = s.replace('\tstruct NmbSelftest out = { 0 };\n', '\tstruct NmbSelftest out = { 0 };\n\t{ pthread_t th; pthread_create(&th, NULL, memwatch, NULL); }\n', 1)
+          s = s.replace('\tmkdir(cache, 0777);\n', """\tmkdir(cache, 0777);
+          \t{
+          \t\t/* launchd gives this daemon a fatal 6 MB limit and ignores JetsamMemoryLimit: raise it ourselves (we are root) */
+          \t\tstruct mlp lim = { 3072, 0, 3072, 0 };
+          \t\tint sr = memorystatus_control(7, getpid(), 0, &lim, sizeof lim);
+          \t\tprintf("set memlimit 3072 MB (non-fatal): ret %d errno %d\\n", sr, sr ? errno : 0);
+          \t\tfflush(stdout);
+          \t}
+          """, 1)
+          assert 'set memlimit' in s
+          assert 'memwatch(NULL)' not in s and 'pthread_create' in s and 'static void *memwatch' in s
+          open(p, 'w').write(s)
+          PY
+
+      - name: SweetMetal2 bundle
+        run: |
+          cd flame
+          phone/metal2/build.sh
+
+      - name: Turnip smoke test binary (vktest)
+        run: |
+          cd flame
+          phone/turnip/build.sh
+
+      - name: Package
+        run: |
+          mkdir -p pkg
+          cd flame
+          cp -R phone/metal2/out/SweetMetal2.bundle phone/metal2/out/m2vtest ../pkg/
+          cp phone/turnip/out/vktest phone/turnip/out/libvulkan_freedreno.dylib ../pkg/
+          cd ../pkg
+          tar -czf ../metal-userland.tar.gz .
+          ls -laR .
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: metal-userland
+          path: metal-userland.tar.gz
