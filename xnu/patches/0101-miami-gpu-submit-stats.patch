@@ -1,0 +1,76 @@
+diff --git a/iokit/Kernel/arm/SweetGPUService.cpp b/iokit/Kernel/arm/SweetGPUService.cpp
+index f70089d..2e0bddd 100644
+--- a/iokit/Kernel/arm/SweetGPUService.cpp
++++ b/iokit/Kernel/arm/SweetGPUService.cpp
+@@ -34,6 +34,7 @@
+ #include <IOKit/IOKitKeys.h>
+ #include <IOKit/IOBufferMemoryDescriptor.h>
+ #include <pexpert/pexpert.h>
++#include <sys/proc.h>
+ #include "SweetSurface.h"
+ #include "SweetGPUABI.h"
+ 
+@@ -181,6 +182,52 @@ sweet_v2_wait_window(uint64_t *base, uint64_t *size, task_t task)
+ 	return -1;
+ }
+ 
++/* GPU use per client process: a line every 250 submits, so a log shows who really renders on the GPU */
++struct sweet_v2_stat {
++	char name[24];
++	uint32_t submits, busy, failed;
++};
++static struct sweet_v2_stat sweet_v2_stats[8];
++static uint32_t sweet_v2_total;
++static IOLock *sweet_v2_stat_lock;
++
++static void
++sweet_v2_note_submit(IOReturn r)
++{
++	char who[24] = "";
++	proc_selfname(who, sizeof(who));
++	if (sweet_v2_stat_lock == NULL) {
++		sweet_v2_stat_lock = IOLockAlloc();
++		if (sweet_v2_stat_lock == NULL) {
++			return;
++		}
++	}
++	IOLockLock(sweet_v2_stat_lock);
++	struct sweet_v2_stat *e = NULL;
++	for (unsigned i = 0; i < 8; i++) {
++		if (sweet_v2_stats[i].name[0] == 0 || strncmp(sweet_v2_stats[i].name, who, sizeof(who)) == 0) {
++			e = &sweet_v2_stats[i];
++			break;
++		}
++	}
++	if (e != NULL) {
++		strlcpy(e->name, who, sizeof(e->name));
++		e->submits++;
++		if (r == kIOReturnBusy) {
++			e->busy++;
++		} else if (r != kIOReturnSuccess) {
++			e->failed++;
++		}
++	}
++	if (++sweet_v2_total % 250 == 0) {
++		for (unsigned i = 0; i < 8 && sweet_v2_stats[i].name[0]; i++) {
++			IOLog("SWEET GPU: submits %s: %u (busy %u, failed %u)\n", sweet_v2_stats[i].name,
++			    sweet_v2_stats[i].submits, sweet_v2_stats[i].busy, sweet_v2_stats[i].failed);
++		}
++	}
++	IOLockUnlock(sweet_v2_stat_lock);
++}
++
+ bool
+ SweetGPUUserClient::initWithTask(task_t owningTask, void *securityID, UInt32 type)
+ {
+@@ -788,8 +835,10 @@ SweetGPUUserClient::v2Method(uint32_t method, const void *in, uint32_t inSize, v
+ 		bool busy = false;
+ 		uint32_t fence = sweet_gpu_submit_v2(iova, dw, rq->buffer_count, &busy);
+ 		if (fence == 0) {
++			sweet_v2_note_submit(busy ? kIOReturnBusy : kIOReturnNotReady);
+ 			return busy ? kIOReturnBusy : kIOReturnNotReady;
+ 		}
++		sweet_v2_note_submit(kIOReturnSuccess);
+ 		fLastFence = fence;
+ 		rp->fence = fence;
+ 		return kIOReturnSuccess;
