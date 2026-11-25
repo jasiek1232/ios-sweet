@@ -284,6 +284,39 @@ jobs:
           open(p, 'w').write(s)
           PY
 
+      - name: Metal's protocols on every object class (iOS 16)
+        run: |
+          cd flame
+          python3 - <<'PY'
+          p = 'phone/metal2/NativeBridgeMetalFrontend.mm'
+          s = open(p).read()
+          old = '''  NBLOG(@"native-metal: MTLTextureImplementation %s",tp?([NBTexture conformsToProtocol:tp]?"adopted":"not adopted"):"missing");}
+          '''
+          new = old + '''  // SweetMetal2 (iOS 16): its Metal checks that descriptors get objects conforming to its own protocols ("vertexFunction is not
+            // a MTLFunction."), and a plain subclass of NSObject does not: declare the conformance at run time on every object class.
+            {static const struct{const char *cls,*proto;} pairs[]={
+              {"NBFunction","MTLFunction"},{"NBLibrary","MTLLibrary"},{"NBBuffer","MTLBuffer"},{"NBSampler","MTLSamplerState"},
+              {"NBDepthStencil","MTLDepthStencilState"},{"NBComputePipeline","MTLComputePipelineState"},{"NBRenderPipeline","MTLRenderPipelineState"},
+              {"NBQueue","MTLCommandQueue"},{"NBCommandBuffer","MTLCommandBuffer"},{"NBEvent","MTLEvent"},{"NBSharedEvent","MTLSharedEvent"},
+              {"NBFence","MTLFence"},{"NBHeap","MTLHeap"},{"NBComputeEncoder","MTLComputeCommandEncoder"},{"NBRenderEncoder","MTLRenderCommandEncoder"},
+              {"NBBlitEncoder","MTLBlitCommandEncoder"},{"NBTexture","MTLTexture"}};
+             for(auto &pr:pairs){Class c=objc_getClass(pr.cls);Protocol *q=objc_getProtocol(pr.proto);
+              if(c&&q&&!class_conformsToProtocol(c,q))class_addProtocol(c,q);
+              NBLOG(@"native-metal: %s conforms to %s: %s",pr.cls,pr.proto,(c&&q)?(class_conformsToProtocol(c,q)?"yes":"no"):"missing");}}
+          '''
+          assert s.count(old) == 1
+          s = s.replace(old, new)
+          o2 = ''' NmbFunction *handle=name?nmb_function_new(_handle,name.UTF8String):nullptr;gTimeFunction.add(functionBegan);
+           if(!handle)return nil;
+          '''
+          n2 = ''' NmbFunction *handle=name?nmb_function_new(_handle,name.UTF8String):nullptr;gTimeFunction.add(functionBegan);
+           if(!handle){static int misses;if(misses++<20)NBLOG(@"native-metal: function %@ not found: %@",name,lastError());return nil;}
+          '''
+          assert s.count(o2) == 1
+          s = s.replace(o2, n2)
+          open(p, 'w').write(s)
+          PY
+
       - name: SweetMetal2 bundle
         run: |
           cd flame
