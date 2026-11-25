@@ -209,6 +209,11 @@ jobs:
     runs-on: ${{ inputs.runner || 'macos-15' }}
     timeout-minutes: 60
     steps:
+      - uses: actions/checkout@v4
+        with:
+          path: src
+          sparse-checkout: tools
+
       - name: Fetch ios-flame sources
         run: |
           git init -q flame
@@ -324,7 +329,7 @@ jobs:
 
       - name: Turnip smoke test binary (vktest, with a full-screen timing test)
         run: |
-          cp tools/vktest-bench.c flame/phone/turnip/vktest.c
+          cp src/tools/vktest-bench.c flame/phone/turnip/vktest.c
           cd flame
           phone/turnip/build.sh
 
