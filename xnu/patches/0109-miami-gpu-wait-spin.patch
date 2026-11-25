@@ -1,0 +1,29 @@
+--- a/bsd/dev/sweet_gpu_a619.c	2026-11-25 23:44:10.382323558 +0100
++++ b/bsd/dev/sweet_gpu_a619.c	2026-11-25 23:44:22.066147538 +0100
+@@ -20,6 +20,7 @@
+ #include <sys/systm.h>
+ #include <sys/errno.h>
+ #include <kern/clock.h>
++#include <mach/mach_time.h>
+ #include <kern/thread.h>
+ #include <kern/sched_prim.h>
+ #include <machine/machine_routines.h>
+@@ -3467,6 +3468,18 @@
+ sweet_gpu_wait(uint32_t seq, unsigned timeout_ms)
+ {
+ 	volatile uint32_t *f = (volatile uint32_t *)gp.fence.kva;
++	/*
++	 * A frame takes the GPU 1-2 ms, but a 1 ms sleep here lasted ~24 ms on this port (no precise timer wake-up):
++	 * poll without sleeping for the first 30 ms, then fall back to sleeping.
++	 */
++	uint64_t spin_end;
++	clock_interval_to_deadline(30, NSEC_PER_MSEC, &spin_end);
++	do {
++		flush_dcache64((addr64_t)gp.fence.pa, 0x1000, TRUE);
++		if ((int32_t)(*f - seq) >= 0)
++			return 0;
++		delay(20);
++	} while (mach_absolute_time() < spin_end);
+ 	for (unsigned i = 0; i <= timeout_ms; i++) {
+ 		flush_dcache64((addr64_t)gp.fence.pa, 0x1000, TRUE);
+ 		if ((int32_t)(*f - seq) >= 0)
