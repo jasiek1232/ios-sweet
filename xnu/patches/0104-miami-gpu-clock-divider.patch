@@ -1,0 +1,19 @@
+diff --git a/bsd/dev/sweet_gpu_a619.c b/bsd/dev/sweet_gpu_a619.c
+index fc23f54..e7acb11 100644
+--- a/bsd/dev/sweet_gpu_a619.c
++++ b/bsd/dev/sweet_gpu_a619.c
+@@ -265,7 +265,13 @@ g_gpu_clock_up(void)
+ 	g_dwait(50);
+ 	volatile uint32_t *cc = (volatile uint32_t *)c;
+ 	/* GX_GFX3D RCG: source select 1 (PLL0), pre-div 2 -> hid_div field 3 */
+-	g_pw("GX_GFX3D_SRC CFG", &cc[0x20 / 4], (1u << 8) | 3u);
++	uint32_t hid_div = 3;	/* sweetgpudiv=N: 3 = /2 (266 MHz, default), 2 = /1.5 (355 MHz), 1 = /1 (532 MHz) */
++	PE_parse_boot_argn("sweetgpudiv", &hid_div, sizeof(hid_div));
++	if (hid_div < 1 || hid_div > 3) {
++		hid_div = 3;
++	}
++	printf("SWEET GPUK: GPU clock divider field %u -> ~%u MHz\n", hid_div, 532u * 2u / (hid_div + 1u));
++	g_pw("GX_GFX3D_SRC CFG", &cc[0x20 / 4], (1u << 8) | hid_div);
+ 	g_pw("GX_GFX3D_SRC CMD update", &cc[0x1c / 4], cc[0x1c / 4] | 1u);
+ 	uint32_t cmd = 0;
+ 	for (int i = 0; i < 100; i++) {
