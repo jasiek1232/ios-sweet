@@ -1,0 +1,28 @@
+--- a/bsd/dev/sweet_rpmh.c	2026-11-25 21:46:12.574726253 +0100
++++ b/bsd/dev/sweet_rpmh.c	2026-11-25 21:46:12.576054396 +0100
+@@ -115,7 +115,9 @@
+ 		printf("SWEET RPMH: RSC/locator mapping failed\n");
+ 		return ENOMEM;
+ 	}
++	printf("SWEET RPMH: reading RSC id at %#x ...\n", RH_RSC_PA);
+ 	uint32_t id = rh_read(rh_rsc, 0);
++	printf("SWEET RPMH: RSC id %#x, reading solver/config ...\n", id);
+ 	uint32_t solver = rh_read(rh_rsc, 4);
+ 	uint32_t config = rh_read(rh_rsc, 0x0c);
+ 	unsigned major = (id >> 16) & 0xffu;
+@@ -131,6 +133,7 @@
+ 		return ENODEV;
+ 	}
+ 	if (!rh_db) {
++		printf("SWEET RPMH: reading cmd-db locator at %#x ...\n", RH_DICT_PA);
+ 		uint32_t pa = rh_read(rh_dict, 0);
+ 		uint32_t size = rh_read(rh_dict, 4);
+ 		printf("SWEET RPMH: cmd-db locator=%#x pa=%#x size=%#x\n", RH_DICT_PA, pa, size);
+@@ -147,6 +150,7 @@
+ 		}
+ 		rh_db_size = size;
+ 	}
++	printf("SWEET RPMH: reading cmd-db header ...\n");
+ 	uint32_t db_version = rh_read(rh_db, 0);
+ 	uint32_t magic = rh_read(rh_db, 4);
+ 	uint32_t flags = rh_read(rh_db, 140);
