@@ -1,0 +1,41 @@
+diff --git a/bsd/dev/sweet_gpu_a619.c b/bsd/dev/sweet_gpu_a619.c
+index edfbfd7..a7082ab 100644
+--- a/bsd/dev/sweet_gpu_a619.c
++++ b/bsd/dev/sweet_gpu_a619.c
+@@ -4231,12 +4231,13 @@ int sweet_rpmh_write(const char *res, unsigned n, const uint32_t *offsets, const
+ /*
+  * DDR (BCM MC0) and the memory NoC (SH0) at their top levels (as ios-flame does): nothing else votes them for the
+  * GPU, and the bootloader's level leaves memory bandwidth low. BCM command: commit | valid | x (avg) | y (peak).
+- * Boot-arg sweetddr=0 leaves them alone.
++ * Boot-arg sweetddr=1 turns it on.
+  */
+ static void
+ g_bus_vote(void)
+ {
+-	uint32_t on = 1;
++	/* off unless sweetddr=1: the first RPMh access on this phone hung the CPU (nothing else uses RPMh here yet) */
++	uint32_t on = 0;
+ 	PE_parse_boot_argn("sweetddr", &on, sizeof(on));
+ 	if (!on) {
+ 		return;
+diff --git a/iokit/Kernel/arm/SweetGPUService.cpp b/iokit/Kernel/arm/SweetGPUService.cpp
+index a82622a..b4cec67 100644
+--- a/iokit/Kernel/arm/SweetGPUService.cpp
++++ b/iokit/Kernel/arm/SweetGPUService.cpp
+@@ -159,14 +159,14 @@ OSDefineMetaClassAndStructors(SweetGPUUserClient, IOUserClient);
+ /*
+  * Metal opens the accelerator as soon as backboardd starts, which can be long before the GPU thread has brought the
+  * GPU up (sweetgpu=5 waits 20 s first). Turnip does not retry, so a refused open means no Metal device for the whole
+- * boot: wait here, up to 3 minutes, until the GPU is ready. The in-kernel self-test (kernel_task) never waits.
++ * boot: wait here, up to 90 seconds, until the GPU is ready. The in-kernel self-test (kernel_task) never waits.
+  */
+ extern "C" int sweet_gpu_tests_done(void);
+ 
+ static int
+ sweet_v2_wait_window(uint64_t *base, uint64_t *size, task_t task)
+ {
+-	for (int i = 0; i < 3000; i++) {
++	for (int i = 0; i < 900; i++) {
+ 		/* the boot-time tests (including a deliberate GPU fault and reset) must be over first */
+ 		if ((task == kernel_task || sweet_gpu_tests_done()) && sweet_gpu_window_alloc(base, size) == 0) {
+ 			if (i) {
