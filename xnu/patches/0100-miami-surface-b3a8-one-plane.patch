@@ -1,0 +1,55 @@
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index 7f90c56..67bb84e 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -34,6 +34,7 @@
+ #include <IOKit/IOLib.h>
+ #include <IOKit/IOLocks.h>
+ #include <IOKit/system.h>
++#include <pexpert/pexpert.h>
+ #include <libkern/c++/OSArray.h>
+ #include <libkern/c++/OSDictionary.h>
+ #include <libkern/c++/OSNumber.h>
+@@ -288,6 +289,33 @@ sweet_surface_layout(SweetSurface *s, OSDictionary *props)
+ 	s->elementWidth = (uint8_t)sweet_dict_u32(props, "IOSurfaceElementWidth", 1);
+ 	s->elementHeight = (uint8_t)sweet_dict_u32(props, "IOSurfaceElementHeight", 1);
+ 	s->pixelFormat = sweet_dict_u32(props, "IOSurfacePixelFormat", 0);
++	/*
++	 * (from HackiOS, as ios-flame has it) 10-bit formats a wide-gamut iPhone asks for ('w30r', 'l10r', 'w30R' and
++	 * 'b3a8', 8-bit with its alpha in a separate plane): the panel is 8-bit sRGB, and with a Metal device Core
++	 * Animation in backboardd picks 'b3a8' for its frame buffers, which cannot be imported as a texture (two
++	 * planes) or scanned out. Made as one-plane BGRA, which the client reads back. Only for backboardd and WebKit's
++	 * content process; boot-arg sweetsurf10=0 never remaps, =2 always does.
++	 */
++	bool one_plane = false;
++	{
++		static int remap10 = -1;
++		if (remap10 < 0) {
++			uint32_t v = 1;
++			PE_parse_boot_argn("sweetsurf10", &v, sizeof(v));
++			remap10 = (int)v;
++		}
++		char who[32] = "";
++		proc_selfname(who, sizeof(who));
++		bool remap = remap10 == 2 || (remap10 == 1 &&
++		    (strcmp(who, "backboardd") == 0 || strcmp(who, "com.apple.WebKit.WebContent") == 0));
++		if (!remap) {
++		} else if (s->pixelFormat == 0x77333072u || s->pixelFormat == 0x6C313072u || s->pixelFormat == 0x77333052u) {
++			s->pixelFormat = 0x42475241u;           /* BGRA */
++		} else if (s->pixelFormat == 0x62336138u) {
++			s->pixelFormat = 0x42475241u;
++			one_plane = true;
++		}
++	}
+ 	s->cacheMode = sweet_dict_u32(props, "IOSurfaceCacheMode", 0);
+ 	s->offset = sweet_dict_u32(props, "IOSurfaceOffset", 0);
+ 	if (s->width > SWEET_SURFACE_MAX_DIM || s->height > SWEET_SURFACE_MAX_DIM ||
+@@ -301,7 +329,7 @@ sweet_surface_layout(SweetSurface *s, OSDictionary *props)
+ 	}
+ 	end = (uint64_t)s->offset + (uint64_t)s->bytesPerRow * sweet_div_up(s->height, s->elementHeight);
+ 
+-	OSArray *planes = OSDynamicCast(OSArray, props->getObject("IOSurfacePlaneInfo"));
++	OSArray *planes = one_plane ? NULL : OSDynamicCast(OSArray, props->getObject("IOSurfacePlaneInfo"));
+ 	s->planeCount = 0;
+ 	if (planes != NULL) {
+ 		uint64_t next = s->offset;
