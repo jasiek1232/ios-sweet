@@ -322,8 +322,9 @@ jobs:
           cd flame
           phone/metal2/build.sh
 
-      - name: Turnip smoke test binary (vktest)
+      - name: Turnip smoke test binary (vktest, with a full-screen timing test)
         run: |
+          cp tools/vktest-bench.c flame/phone/turnip/vktest.c
           cd flame
           phone/turnip/build.sh
 
