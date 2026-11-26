@@ -1,0 +1,15 @@
+--- a/bsd/dev/sweet_gpu_a619.c
++++ b/bsd/dev/sweet_gpu_a619.c
+@@ -3585,7 +3585,11 @@
+ 		/* 0116: the cache filled up after ~550 jobs and every later dump decoded nothing; reuse the oldest slot */
+ 		k = next;
+ 		next = (next + 1) % 48;
+-		ml_io_unmap(c[k].va, 0x1000);
++		/*
++		 * 0118: io_map() hands back va + (pa & PAGE_MASK) inside one whole 16 KB kernel page; unmapping 4 KB at that va
++		 * hit pmap_remove_options()' alignment panic. Free the whole kernel page the mapping lives in.
++		 */
++		ml_io_unmap(c[k].va & ~(vm_offset_t)PAGE_MASK, (vm_size_t)PAGE_MASK + 1);
+ 	}
+ 	c[k].page = page;
+ 	c[k].va = va;
