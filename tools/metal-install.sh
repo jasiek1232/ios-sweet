@@ -60,6 +60,12 @@ if [[ -d $stage/SweetMetal2.bundle ]]; then
 	printf 'SpringBoard\n' > "$mnt/private/var/local/mtl2-clients"
 	chown 0:0 "$mnt/private/var/local/mtl2-clients"; chmod 644 "$mnt/private/var/local/mtl2-clients"
 	install -d -o 0 -g 0 -m 777 "$mnt/private/var/local/m2v-cache"
+# optional: TU_DEBUG_OPTS=sysmem sudo ./metal-install.sh ...  -> Turnip options + log (/var/local/turnip-<proc>.log) in every Metal client
+if [[ -n ${TU_DEBUG_OPTS:-} ]]; then
+	printf '%s\n' "$TU_DEBUG_OPTS" > "$mnt/private/var/local/mtl2-tu-debug"; chmod 644 "$mnt/private/var/local/mtl2-tu-debug"
+else
+	rm -f "$mnt/private/var/local/mtl2-tu-debug"
+fi
 fi
 
 echo "== launchd job"
