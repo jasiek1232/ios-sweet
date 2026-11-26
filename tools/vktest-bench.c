@@ -11,7 +11,7 @@
 #include <time.h>
 #define VK_NO_PROTOTYPES
 #include <vulkan/vulkan.h>
-#include "shaders.h"	/* fill_comp, tri_vert, tri_frag: SPIR-V words (build.sh) */
+#include "shaders.h"	/* fill_comp, tri_vert, tri_frag, quad_vert, quad_frag: SPIR-V words (build.sh) */
 
 static PFN_vkGetInstanceProcAddr gipa;
 static PFN_vkGetDeviceProcAddr gdpa;
@@ -335,6 +335,162 @@ static int test_draw(uint32_t W, uint32_t H, int bench)
 	return !ok;
 }
 
+
+/* one graphics pipeline for the full-screen cases: vertex + fragment SPIR-V, layout, optional alpha blending */
+static VkPipeline mkpipe(const uint32_t *vs, size_t vsz, const uint32_t *fs, size_t fsz, VkPipelineLayout pl, int blend)
+{
+	DFN(vkCreateGraphicsPipelines);
+	VkPipelineShaderStageCreateInfo st[2] = {
+		{ .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_VERTEX_BIT,
+		  .module = module(vs, vsz), .pName = "main" },
+		{ .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_FRAGMENT_BIT,
+		  .module = module(fs, fsz), .pName = "main" },
+	};
+	VkPipelineVertexInputStateCreateInfo vin = { .sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO };
+	VkPipelineInputAssemblyStateCreateInfo ia = { .sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
+		.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST };
+	VkPipelineViewportStateCreateInfo vp = { .sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO, .viewportCount = 1,
+		.scissorCount = 1 };
+	VkPipelineRasterizationStateCreateInfo rs = { .sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
+		.polygonMode = VK_POLYGON_MODE_FILL, .cullMode = VK_CULL_MODE_NONE, .lineWidth = 1 };
+	VkPipelineMultisampleStateCreateInfo ms = { .sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
+		.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT };
+	VkPipelineColorBlendAttachmentState cba = { .blendEnable = blend ? VK_TRUE : VK_FALSE,
+		.srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA, .dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA,
+		.colorBlendOp = VK_BLEND_OP_ADD, .srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE,
+		.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA, .alphaBlendOp = VK_BLEND_OP_ADD, .colorWriteMask = 0xf };
+	VkPipelineColorBlendStateCreateInfo cb = { .sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
+		.attachmentCount = 1, .pAttachments = &cba };
+	VkDynamicState dyn[2] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR };
+	VkPipelineDynamicStateCreateInfo ds = { .sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO, .dynamicStateCount = 2,
+		.pDynamicStates = dyn };
+	VkFormat fmt = VK_FORMAT_R8G8B8A8_UNORM;
+	VkPipelineRenderingCreateInfo ri = { .sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO, .colorAttachmentCount = 1,
+		.pColorAttachmentFormats = &fmt };
+	VkGraphicsPipelineCreateInfo gpi = { .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, .pNext = &ri,
+		.stageCount = 2, .pStages = st, .pVertexInputState = &vin, .pInputAssemblyState = &ia, .pViewportState = &vp,
+		.pRasterizationState = &rs, .pMultisampleState = &ms, .pColorBlendState = &cb, .pDynamicState = &ds, .layout = pl };
+	VkPipeline p;
+	CHECK(vkCreateGraphicsPipelines(dev, VK_NULL_HANDLE, 1, &gpi, NULL, &p));
+	return p;
+}
+
+static VkImage mkimg(uint32_t W, uint32_t H, VkImageUsageFlags usage, VkImageView *view)
+{
+	DFN(vkCreateImage); DFN(vkGetImageMemoryRequirements); DFN(vkAllocateMemory); DFN(vkBindImageMemory);
+	DFN(vkCreateImageView);
+	VkImageCreateInfo ii = { .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .imageType = VK_IMAGE_TYPE_2D,
+		.format = VK_FORMAT_R8G8B8A8_UNORM, .extent = { W, H, 1 }, .mipLevels = 1, .arrayLayers = 1,
+		.samples = VK_SAMPLE_COUNT_1_BIT, .tiling = VK_IMAGE_TILING_OPTIMAL, .usage = usage };
+	VkImage img;
+	CHECK(vkCreateImage(dev, &ii, NULL, &img));
+	VkMemoryRequirements mr;
+	vkGetImageMemoryRequirements(dev, img, &mr);
+	VkMemoryAllocateInfo ai = { .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = mr.size,
+		.memoryTypeIndex = memtype(mr.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) };
+	VkDeviceMemory im;
+	CHECK(vkAllocateMemory(dev, &ai, NULL, &im));
+	CHECK(vkBindImageMemory(dev, img, im, 0));
+	VkImageViewCreateInfo vi = { .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = img, .viewType = VK_IMAGE_VIEW_TYPE_2D,
+		.format = VK_FORMAT_R8G8B8A8_UNORM, .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 } };
+	CHECK(vkCreateImageView(dev, &vi, NULL, view));
+	return img;
+}
+
+/*
+ * What does a compositor-style frame cost? Full-screen passes at panel size: opaque colour, alpha blended colour,
+ * textured (one RGBA8 texture, bilinear), textured + blended; 1 and 4 full-screen draws per render pass.
+ * backboardd's real jobs take 6-28 ms on the GPU, a clear + partial triangle takes ~1 ms: this shows which kind of pass costs.
+ */
+static void test_fullscreen(uint32_t W, uint32_t H)
+{
+	DFN(vkCreateSampler); DFN(vkCreateDescriptorSetLayout); DFN(vkCreateDescriptorPool); DFN(vkAllocateDescriptorSets);
+	DFN(vkUpdateDescriptorSets); DFN(vkCreatePipelineLayout); DFN(vkCmdPipelineBarrier); DFN(vkCmdBeginRendering);
+	DFN(vkCmdEndRendering); DFN(vkCmdBindPipeline); DFN(vkCmdDraw); DFN(vkCmdSetViewport); DFN(vkCmdSetScissor);
+	DFN(vkCmdBindDescriptorSets);
+	VkImageView cv, tv;
+	VkImage cimg = mkimg(W, H, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT, &cv);
+	VkImage timg = mkimg(W, H, VK_IMAGE_USAGE_SAMPLED_BIT, &tv);
+	VkSamplerCreateInfo sci = { .sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO, .magFilter = VK_FILTER_LINEAR,
+		.minFilter = VK_FILTER_LINEAR, .addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+		.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE, .addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE };
+	VkSampler smp;
+	CHECK(vkCreateSampler(dev, &sci, NULL, &smp));
+	VkDescriptorSetLayoutBinding bnd = { .binding = 0, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+		.descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT };
+	VkDescriptorSetLayoutCreateInfo dli = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, .bindingCount = 1,
+		.pBindings = &bnd };
+	VkDescriptorSetLayout dsl;
+	CHECK(vkCreateDescriptorSetLayout(dev, &dli, NULL, &dsl));
+	VkDescriptorPoolSize dps = { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1 };
+	VkDescriptorPoolCreateInfo dpi = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, .maxSets = 1, .poolSizeCount = 1,
+		.pPoolSizes = &dps };
+	VkDescriptorPool dpool;
+	CHECK(vkCreateDescriptorPool(dev, &dpi, NULL, &dpool));
+	VkDescriptorSetAllocateInfo dai = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, .descriptorPool = dpool,
+		.descriptorSetCount = 1, .pSetLayouts = &dsl };
+	VkDescriptorSet dset;
+	CHECK(vkAllocateDescriptorSets(dev, &dai, &dset));
+	VkDescriptorImageInfo dii = { .sampler = smp, .imageView = tv, .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
+	VkWriteDescriptorSet wds = { .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = dset, .dstBinding = 0,
+		.descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .pImageInfo = &dii };
+	vkUpdateDescriptorSets(dev, 1, &wds, 0, NULL);
+	VkPipelineLayoutCreateInfo pl0 = { .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
+	VkPipelineLayoutCreateInfo pl1 = { .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, .setLayoutCount = 1, .pSetLayouts = &dsl };
+	VkPipelineLayout lay0, lay1;
+	CHECK(vkCreatePipelineLayout(dev, &pl0, NULL, &lay0));
+	CHECK(vkCreatePipelineLayout(dev, &pl1, NULL, &lay1));
+	/* quad_vert + tri_frag (constant red) and quad_vert + quad_frag (texture); quad.vert writes a uv output tri_frag ignores */
+	struct { const char *name; VkPipeline p; int tex; } cases[4] = {
+		{ "opaque colour       ", mkpipe(quad_vert, sizeof(quad_vert), tri_frag, sizeof(tri_frag), lay0, 0), 0 },
+		{ "blended colour      ", mkpipe(quad_vert, sizeof(quad_vert), tri_frag, sizeof(tri_frag), lay0, 1), 0 },
+		{ "textured            ", mkpipe(quad_vert, sizeof(quad_vert), quad_frag, sizeof(quad_frag), lay1, 0), 1 },
+		{ "textured + blended  ", mkpipe(quad_vert, sizeof(quad_vert), quad_frag, sizeof(quad_frag), lay1, 1), 1 },
+	};
+	static const int draws[2] = { 1, 4 };
+	for (int c = 0; c < 4; c++) {
+		for (int d = 0; d < 2; d++) {
+			double sum = 0, best = 1e9;
+			const int N = 10;
+			for (int it = 0; it < N; it++) {
+				VkCommandBuffer bc = begin();
+				VkImageMemoryBarrier bb[2] = {
+					{ .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, .dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+					  .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED, .newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, .image = cimg,
+					  .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 } },
+					{ .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
+					  .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED, .newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, .image = timg,
+					  .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 } },
+				};
+				vkCmdPipelineBarrier(bc, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+				    VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, NULL, 0, NULL, 2, bb);
+				VkRenderingAttachmentInfo ba = { .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO, .imageView = cv,
+					.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
+					.storeOp = VK_ATTACHMENT_STORE_OP_STORE, .clearValue.color.float32 = { 0, 0, 1, 1 } };
+				VkRenderingInfo br = { .sType = VK_STRUCTURE_TYPE_RENDERING_INFO, .renderArea = { { 0, 0 }, { W, H } },
+					.layerCount = 1, .colorAttachmentCount = 1, .pColorAttachments = &ba };
+				vkCmdBeginRendering(bc, &br);
+				vkCmdBindPipeline(bc, VK_PIPELINE_BIND_POINT_GRAPHICS, cases[c].p);
+				if (cases[c].tex)
+					vkCmdBindDescriptorSets(bc, VK_PIPELINE_BIND_POINT_GRAPHICS, lay1, 0, 1, &dset, 0, NULL);
+				VkViewport bv = { 0, 0, W, H, 0, 1 };
+				VkRect2D bs = { { 0, 0 }, { W, H } };
+				vkCmdSetViewport(bc, 0, 1, &bv);
+				vkCmdSetScissor(bc, 0, 1, &bs);
+				for (int k = 0; k < draws[d]; k++)
+					vkCmdDraw(bc, 3, 1, 0, 0);
+				vkCmdEndRendering(bc);
+				double bt = submit_wait(bc);
+				sum += bt;
+				if (bt < best)
+					best = bt;
+			}
+			printf("FULLSCREEN %ux%u %s %d draw%s per pass: best %.2f ms, avg %.2f ms\n", W, H, cases[c].name, draws[d],
+			       draws[d] > 1 ? "s" : " ", best, sum / N);
+		}
+	}
+}
+
 int main(int argc, char **argv)
 {
 	const char *lib = argc > 1 ? argv[1] : "/var/local/lib/libvulkan_freedreno.dylib";
@@ -391,6 +547,7 @@ int main(int argc, char **argv)
 	fails += test_compute();
 	fails += test_draw(256, 256, 0);
 	fails += test_draw(1125, 2436, 1);
+	test_fullscreen(1125, 2436);
 	printf("%s: %d failed\n", fails ? "FAIL" : "ALL PASS", fails);
 	return fails != 0;
 }

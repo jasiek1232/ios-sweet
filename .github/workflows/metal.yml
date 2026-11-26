@@ -330,7 +330,10 @@ jobs:
       - name: Turnip smoke test binary (vktest, with a full-screen timing test)
         run: |
           cp src/tools/vktest-bench.c flame/phone/turnip/vktest.c
+          cp src/tools/quad.vert src/tools/quad.frag flame/phone/turnip/shaders/
           cd flame
+          sed -i 's/tri.frag:tri_frag; do/tri.frag:tri_frag quad.vert:quad_vert quad.frag:quad_frag; do/' phone/turnip/build.sh
+          grep -n quad_frag phone/turnip/build.sh
           phone/turnip/build.sh
 
       - name: Package
