@@ -1,0 +1,678 @@
+--- a/bsd/dev/sweet_gpu_a619.c
++++ b/bsd/dev/sweet_gpu_a619.c
+@@ -3412,6 +3412,24 @@
+ static uint32_t g_dump_logged;
+ uint64_t sweet_gpu_fence_submit_time(uint32_t fence);
+ 
++/* ---- 0114 diagnostics: every counter below answers one "could it be ...?" question, printed by sweet_gpu_diag() ---- */
++extern void absolutetime_to_nanoseconds(uint64_t abstime, uint64_t *result);
++extern unsigned int vm_page_free_count;
++void sweet_gpu_diag(const char *why);
++static uint32_t g_dg_note_seq[64];	/* last fence noted per slot: several waiters of one fence count once */
++static uint32_t g_dg_dump_seq[64];
++static uint32_t g_dg_hist[8];		/* GPU execution of a job: <1 <2 <5 <10 <20 <40 <80 >=80 ms */
++static uint64_t g_dg_exec_us, g_dg_jobs;
++static struct { char nm[17]; uint32_t jobs; uint64_t exec_us; } g_dg_proc[6];
++static uint32_t g_dg_ring_hw, g_dg_ring_full_waits, g_dg_lock_slow, g_dg_busy_returns, g_dg_q_logged;
++static uint64_t g_dg_lock_max_ns;
++static uint8_t g_dg_ahead[64];		/* jobs still unfinished when this one was queued */
++static uint32_t g_dg_ahead_hist[5];	/* 0 1 2 3 4+ jobs ahead */
++static uint32_t g_dg_wait_n[3], g_dg_wait_to[3];	/* waits asked for 0 ms / 1-29 ms / 30+ ms: all, and those that timed out */
++static uint64_t g_dg_wait_ns[3];	/* CPU time spent inside them */
++static uint32_t g_dg_wait_logged, g_dg_pool_hw;
++static uint32_t g_dg_ev[64], g_dg_blt[16];	/* CP_EVENT_WRITE event ids and CP_BLIT ops seen in decoded slow jobs */
++
+ uint64_t
+ sweet_gpu_fence_submit_time(uint32_t fence)
+ {
+@@ -3431,22 +3449,44 @@
+ 	const unsigned head = g_wrap ? 4 : 0;
+ 	const unsigned total = head + n + 6 + 9;	/* + WAIT_FOR_IDLE (1) + fence write (5 / 4 old) */
+ 	unsigned tries = 0;
++	uint32_t used = 0;
++	const uint64_t tl0 = mach_absolute_time();
+ 
+ 	if (!svc.ready || n == 0 || total > G_RING_DW / 2)
+ 		return -1;
+ 	for (;;) {
+ 		lck_mtx_lock(&g_svc_lock);
+ 		uint32_t rp = *(volatile uint32_t *)svc.rptr_va;
+-		uint32_t used = (svc.wptr - rp) & (G_RING_DW - 1);
++		used = (svc.wptr - rp) & (G_RING_DW - 1);
+ 		if (G_RING_DW - 1 - used >= total)
+ 			break;		/* enough room; the lock stays held */
+ 		lck_mtx_unlock(&g_svc_lock);
+-		if (++tries > 5000)
++		if (++tries > 5000) {
++			g_dg_busy_returns++;
+ 			return -2;	/* ring stayed full for ~5 s: the GPU is stuck */
++		}
+ 		g_settle(1);
+ 	}
++	{
++		uint64_t dns = 0;
++		absolutetime_to_nanoseconds(mach_absolute_time() - tl0, &dns);
++		if (dns > g_dg_lock_max_ns)
++			g_dg_lock_max_ns = dns;
++		if (dns > 2000000ull)
++			g_dg_lock_slow++;
++		g_dg_ring_full_waits += tries;
++		if (used > g_dg_ring_hw)
++			g_dg_ring_hw = used;
++	}
+ 	uint32_t w = svc.wptr;
+ 	const uint32_t seq = ++svc.seq;
++	{
++		flush_dcache64((addr64_t)gp.fence.pa, 0x1000, TRUE);
++		int32_t ahead = (int32_t)(seq - 1 - *(volatile uint32_t *)gp.fence.kva);
++		ahead = ahead < 0 ? 0 : ahead > 255 ? 255 : ahead;
++		g_dg_ahead[seq & 63] = (uint8_t)ahead;
++		g_dg_ahead_hist[ahead > 4 ? 4 : ahead]++;
++	}
+ 	g_sub_gts[seq & 63] = sweet_gpu_timestamp();
+ 	proc_selfname(g_sub_nm[seq & 63], 16);
+ 	g_sub_nm[seq & 63][16] = 0;
+@@ -3552,6 +3592,15 @@
+ 		if ((h >> 28) == 7u) {
+ 			uint32_t cnt = h & 0x7fff, op = (h >> 16) & 0x7f;
+ 			g_dh7[op]++;
++			if ((op == 0x46 || op == 0x2c) && cnt >= 1) {
++				const volatile uint32_t *pl = g_dbg_rd(iova + 4ull * (i + 1));
++				if (pl) {
++					if (op == 0x46)
++						g_dg_ev[*pl & 63]++;
++					else
++						g_dg_blt[*pl & 15]++;
++				}
++			}
+ 			if (op == 0x3f && cnt >= 3 && depth < 3) {
+ 				const volatile uint32_t *a = g_dbg_rd(iova + 4ull * (i + 1)), *b = g_dbg_rd(iova + 4ull * (i + 2)),
+ 				    *z = g_dbg_rd(iova + 4ull * (i + 3));
+@@ -3572,10 +3621,15 @@
+ g_dbg_dump(uint32_t seq)
+ {
+ 	static volatile int busy;
+-	if (busy || g_dump_logged >= 14)
++	if (busy || g_dump_logged >= 40 || g_dg_dump_seq[seq & 63] == seq)
+ 		return;
+ 	busy = 1;
++	g_dg_dump_seq[seq & 63] = seq;
+ 	g_dump_logged++;
++	for (unsigned i = 0; i < 64; i++)
++		g_dg_ev[i] = 0;
++	for (unsigned i = 0; i < 16; i++)
++		g_dg_blt[i] = 0;
+ 	for (unsigned i = 0; i < 128; i++)
+ 		g_dh7[i] = 0;
+ 	g_dh4 = g_dtot = 0;
+@@ -3587,6 +3641,15 @@
+ 		if (g_dh7[i])
+ 			printf(" %x:%u", i, g_dh7[i]);
+ 	printf("\n");
++	printf("SWEET GPUIB: seq %u: CP_EVENT_WRITE event ids (hex:count):", seq);
++	for (unsigned i = 0; i < 64; i++)
++		if (g_dg_ev[i])
++			printf(" %x:%u", i, g_dg_ev[i]);
++	printf("; CP_BLIT ops (0 fill/clear, 1 copy, 3 scale; hex:count):");
++	for (unsigned i = 0; i < 16; i++)
++		if (g_dg_blt[i])
++			printf(" %x:%u", i, g_dg_blt[i]);
++	printf("\n");
+ 	busy = 0;
+ }
+ 
+@@ -3598,11 +3661,42 @@
+ 	uint64_t now = sweet_gpu_timestamp(), sub = g_sub_gts[seq & 63];
+ 	if (!st || !en || en < st || st < sub || now < en)
+ 		return;
++	if (g_dg_note_seq[seq & 63] == seq)
++		return;		/* a second waiter of the same fence */
++	g_dg_note_seq[seq & 63] = seq;
++	{
++		uint64_t xus = (en - st) * 10 / 192, qus = (st - sub) * 10 / 192;
++		unsigned b = xus < 1000 ? 0 : xus < 2000 ? 1 : xus < 5000 ? 2 : xus < 10000 ? 3 : xus < 20000 ? 4 : xus < 40000 ? 5 : xus < 80000 ? 6 : 7;
++		unsigned pi;
++		g_dg_hist[b]++;
++		g_dg_exec_us += xus;
++		g_dg_jobs++;
++		for (pi = 0; pi < 6; pi++)
++			if (g_dg_proc[pi].nm[0] == 0 || strncmp(g_dg_proc[pi].nm, g_sub_nm[seq & 63], 16) == 0)
++				break;
++		if (pi < 6) {
++			if (!g_dg_proc[pi].nm[0])
++				strlcpy(g_dg_proc[pi].nm, g_sub_nm[seq & 63], sizeof(g_dg_proc[pi].nm));
++			g_dg_proc[pi].jobs++;
++			g_dg_proc[pi].exec_us += xus;
++		}
++		if (qus > 5000 && g_dg_q_logged < 40) {
++			/* a long wait before the job starts: is it the previous job's tail (queued behind it), or idle time? */
++			volatile uint32_t *pt = (volatile uint32_t *)((uintptr_t)gp.fence.kva + G_TS_OFF + 16u * ((seq - 1) & 63));
++			uint64_t pst = ((uint64_t)pt[1] << 32) | pt[0], pen = ((uint64_t)pt[3] << 32) | pt[2];
++			g_dg_q_logged++;
++			printf("SWEET GPUQUEUE: seq %u '%s': waited %llu us to start, %u jobs unfinished when queued; previous job (seq %u): started %llu us after this one was queued, ended %llu us after, ran %llu us\n",
++			    seq, g_sub_nm[seq & 63], qus, g_dg_ahead[seq & 63], seq - 1,
++			    pst >= sub ? (pst - sub) * 10 / 192 : 0, pen >= sub ? (pen - sub) * 10 / 192 : 0,
++			    pen > pst ? (pen - pst) * 10 / 192 : 0);
++		}
++	}
+ 	if (en - st > 96000 && g_slow_logged < 60) {	/* > 5 ms on the GPU */
+ 		g_slow_logged++;
+ 		printf("SWEET GPUSLOW: seq %u from '%s': %u cmd dwords, queue %llu us, execution %llu us\n", seq,
+ 		    g_sub_nm[seq & 63], g_sub_n[seq & 63], (st - sub) * 10 / 192, (en - st) * 10 / 192);
+-		g_dbg_dump(seq);
++		if (en - st > 230400 || g_dump_logged < 8)
++			g_dbg_dump(seq);
+ 	}
+ 	g_ls_n++;
+ 	g_ls_q += st - sub;
+@@ -3617,10 +3711,23 @@
+ 	}
+ }
+ 
++static void
++g_dg_wait_done(unsigned wb, uint64_t w0, int ok)
++{
++	uint64_t ns = 0;
++	absolutetime_to_nanoseconds(mach_absolute_time() - w0, &ns);
++	g_dg_wait_n[wb]++;
++	g_dg_wait_ns[wb] += ns;
++	if (!ok)
++		g_dg_wait_to[wb]++;
++}
++
+ __attribute__((optnone, noinline)) int
+ sweet_gpu_wait(uint32_t seq, unsigned timeout_ms)
+ {
+ 	volatile uint32_t *f = (volatile uint32_t *)gp.fence.kva;
++	const uint64_t w0 = mach_absolute_time();
++	const unsigned wb = timeout_ms == 0 ? 0 : timeout_ms < 30 ? 1 : 2;
+ 	/*
+ 	 * A frame takes the GPU 1-2 ms, but a 1 ms sleep here lasted ~24 ms on this port (no precise timer wake-up):
+ 	 * poll without sleeping for the first 30 ms, then fall back to sleeping.
+@@ -3632,6 +3739,7 @@
+ 		if ((int32_t)(*f - seq) >= 0)
+ 		{
+ 			g_lat_note(seq);
++			g_dg_wait_done(wb, w0, 1);
+ 			return 0;
+ 		}
+ 		delay(20);
+@@ -3641,10 +3749,12 @@
+ 		if ((int32_t)(*f - seq) >= 0)
+ 		{
+ 			g_lat_note(seq);
++			g_dg_wait_done(wb, w0, 1);
+ 			return 0;
+ 		}
+ 		g_settle(1);
+ 	}
++	g_dg_wait_done(wb, w0, 0);
+ 	return -1;
+ }
+ 
+@@ -3909,6 +4019,14 @@
+ 	if (sweet_gpu_wait(fence, ms) == 0)
+ 		return 0;
+ 	flush_dcache64((addr64_t)gp.fence.pa, 0x1000, TRUE);
++	if (ms >= 10 && g_dg_wait_logged < 30) {
++		char nm[17] = "";
++		proc_selfname(nm, 16);
++		g_dg_wait_logged++;
++		printf("SWEET DIAG: wait for fence %u gave up after %u ms in '%s' (fence page %u, was %u, submitted %u)\n", fence, ms, nm, *f, before, svc.seq);
++		if (g_dg_wait_logged <= 3)
++			sweet_gpu_diag("wait timeout");
++	}
+ 	if (ms >= 1000 && *f == before && (int32_t)(svc.seq - before) > 0) {
+ 		vm_offset_t cb = g_gpu_map(0x05948000ull);
+ 		if (cb) {
+@@ -3992,6 +4110,59 @@
+ 	lck_mtx_unlock(&g_pool_lock);
+ }
+ 
++/* 0114: one snapshot of everything that could stall or kill the GPU path */
++void
++sweet_gpu_diag(const char *why)
++{
++	uint32_t st = 0, i0 = 0, hf = 0, rp = 0, fsr = 0, fsy = 0, done;
++	uint64_t far = 0;
++	vm_offset_t v;
++	unsigned total = (unsigned)(G_POOL_SIZE / G_POOL_PAGE), used = 0, run = 0, best = 0, wins = 0;
++
++	flush_dcache64((addr64_t)gp.fence.pa, 0x1000, TRUE);
++	done = *(volatile uint32_t *)gp.fence.kva;
++	if ((v = g_gpu_map(G_CP_BASE + 0x210 * 4)))
++		st = *(volatile uint32_t *)v;
++	if ((v = g_gpu_map(G_CP_BASE + 0x201 * 4)))
++		i0 = *(volatile uint32_t *)v;
++	if ((v = g_gpu_map(G_CP_BASE + 0x821 * 4)))
++		hf = *(volatile uint32_t *)v;
++	if (svc.rptr_va)
++		rp = *(volatile uint32_t *)svc.rptr_va;
++	if ((v = g_gpu_map(0x05948000ull))) {
++		fsr = *(volatile uint32_t *)(v + 0x58);
++		far = *(volatile uint32_t *)(v + 0x60) | ((uint64_t)*(volatile uint32_t *)(v + 0x64) << 32);
++		fsy = *(volatile uint32_t *)(v + 0x68);
++	}
++	lck_mtx_lock(&g_pool_lock);
++	for (unsigned i = 0; i < total; i++) {
++		if (g_pool_used[i]) {
++			used++;
++			run = 0;
++		} else if (++run > best) {
++			best = run;
++		}
++	}
++	lck_mtx_unlock(&g_pool_lock);
++	if (used > g_dg_pool_hw)
++		g_dg_pool_hw = used;
++	for (unsigned i = 0; i < G_WIN_MAX; i++)
++		wins += g_win_used[i];
++	printf("SWEET DIAG gpu[%s]: fence done %u of %u queued (%d outstanding); ring wptr %u rptr %u, most used %u of %u dwords, full-ring waits %u, busy returns %u; RBBM_STATUS 0x%x INT0 0x%x HW_FAULT 0x%x; SMMU fsr 0x%x fsynr 0x%x far 0x%llx\n",
++	    why, done, svc.seq, (int)(svc.seq - done), svc.wptr, rp, g_dg_ring_hw, G_RING_DW, g_dg_ring_full_waits, g_dg_busy_returns,
++	    st, i0, hf, fsr, fsy, (unsigned long long)far);
++	printf("SWEET DIAG mem: pool %u of %u pages used (high %u, largest free run %u), GPU table pages %u of %u, client windows %u of %u, GPU resets %llu, free RAM %u pages\n",
++	    used, total, g_dg_pool_hw, best, gp.pt_used, G_PT_PAGES, wins, (unsigned)G_WIN_MAX, (unsigned long long)g_epoch, vm_page_free_count);
++	printf("SWEET DIAG jobs: %llu timed, avg %llu us; execution <1/<2/<5/<10/<20/<40/<80/more ms: %u %u %u %u %u %u %u %u; jobs ahead when queued 0/1/2/3/4+: %u %u %u %u %u\n",
++	    g_dg_jobs, g_dg_jobs ? g_dg_exec_us / g_dg_jobs : 0, g_dg_hist[0], g_dg_hist[1], g_dg_hist[2], g_dg_hist[3], g_dg_hist[4], g_dg_hist[5],
++	    g_dg_hist[6], g_dg_hist[7], g_dg_ahead_hist[0], g_dg_ahead_hist[1], g_dg_ahead_hist[2], g_dg_ahead_hist[3], g_dg_ahead_hist[4]);
++	for (unsigned i = 0; i < 6 && g_dg_proc[i].nm[0]; i++)
++		printf("SWEET DIAG jobs of '%s': %u, GPU time %llu ms\n", g_dg_proc[i].nm, g_dg_proc[i].jobs, g_dg_proc[i].exec_us / 1000);
++	printf("SWEET DIAG waits: asked for 0 ms: %u (timed out %u, %llu ms of CPU); 1-29 ms: %u (%u, %llu ms); 30+ ms: %u (%u, %llu ms); submit-lock waits over 2 ms: %u, longest %llu us\n",
++	    g_dg_wait_n[0], g_dg_wait_to[0], g_dg_wait_ns[0] / 1000000, g_dg_wait_n[1], g_dg_wait_to[1], g_dg_wait_ns[1] / 1000000,
++	    g_dg_wait_n[2], g_dg_wait_to[2], g_dg_wait_ns[2] / 1000000, g_dg_lock_slow, g_dg_lock_max_ns / 1000);
++}
++
+ /* one probe: map two pages at iova, run an indirect buffer there that writes a word into the second page */
+ static int
+ g_user_probe(uint64_t iova, vm_offset_t um, uint64_t upa, uint32_t magic)
+@@ -4116,6 +4287,7 @@
+ 	lck_mtx_lock(&g_svc_lock);
+ 	svc.ready = 0;
+ 	g_epoch++;
++	printf("SWEET DIAG: GPU reset number %llu (every client is told its work was lost)\n", (unsigned long long)g_epoch);
+ 	printf("SWEET GPUQ: recovering the GPU (soft reset)\n");
+ 	g_clear_fault();
+ 	g_gw("RBBM_SW_RESET_CMD", 0x43, 1);
+--- a/iokit/Kernel/arm/SweetGPUService.cpp
++++ b/iokit/Kernel/arm/SweetGPUService.cpp
+@@ -55,6 +55,10 @@
+ int sweet_gpu_pool_alloc(uint64_t bytes, uint64_t *pa);
+ void sweet_gpu_pool_free(uint64_t pa, uint64_t bytes);
+ int sweet_gpu_boot_mode(void);
++void sweet_gpu_diag(const char *why);
++uint64_t mach_absolute_time(void);
++void absolutetime_to_nanoseconds(uint64_t abstime, uint64_t *result);
++void sweet_v2_diag_print(void);
+ }
+ 
+ #define SWEET_V2_OPEN_TYPE      0x4147  /* the darwin backend's default ('AG') */
+@@ -118,6 +122,79 @@
+ 	return true;
+ }
+ 
++/* ---- 0114 diagnostics: what every v2 call costs, which fail, who is inside the kernel right now ---- */
++struct sweet_dg_method {
++	uint32_t calls, fails, slow, max_us, last_rc;
++	uint64_t total_us;
++};
++static struct sweet_dg_method sweet_dg_m[32];
++struct sweet_dg_flight {
++	void *th;
++	uint32_t method;
++	uint64_t t0;
++	char nm[24];
++};
++static struct sweet_dg_flight sweet_dg_if[16];
++struct sweet_dg_proc {
++	char nm[24];
++	uint32_t calls, fails;
++	uint64_t last;
++};
++static struct sweet_dg_proc sweet_dg_pr[6];
++static uint32_t sweet_dg_fail_logged, sweet_dg_slow_logged;
++static int64_t sweet_dg_bo_live, sweet_dg_bo_created, sweet_dg_pool_bytes, sweet_dg_imp_bytes, sweet_dg_clients;
++static const struct { uint32_t m; const char *n; } sweet_dg_names[] = {
++	{ NativeAdrenoMethodQuery, "Query" }, { NativeAdrenoMethodGetDeviceInfo, "GetDeviceInfo" },
++	{ NativeAdrenoMethodBoAlloc, "BoAlloc" }, { NativeAdrenoMethodBoImport, "BoImport" },
++	{ NativeAdrenoMethodBoMap, "BoMap" }, { NativeAdrenoMethodBoFree, "BoFree" },
++	{ NativeAdrenoMethodBoCpuMap, "BoCpuMap" }, { NativeAdrenoMethodBoCpuUnmap, "BoCpuUnmap" },
++	{ NativeAdrenoMethodSubmit, "Submit" }, { NativeAdrenoMethodWaitFence, "WaitFence" },
++	{ NativeAdrenoMethodGetTimestamp, "GetTimestamp" }, { NativeAdrenoMethodGetStatus, "GetStatus" },
++	{ NativeAdrenoMethodSetMetadata, "SetMetadata" }, { NativeAdrenoMethodGetMetadata, "GetMetadata" },
++	{ NativeAdrenoMethodCreateQueue, "CreateQueue" }, { NativeAdrenoMethodCloseQueue, "CloseQueue" },
++};
++
++static const char *
++sweet_dg_name(uint32_t m)
++{
++	for (unsigned i = 0; i < sizeof(sweet_dg_names) / sizeof(sweet_dg_names[0]); i++) {
++		if (sweet_dg_names[i].m == m) {
++			return sweet_dg_names[i].n;
++		}
++	}
++	return "?";
++}
++
++extern "C" void
++sweet_v2_diag_print(void)
++{
++	uint64_t now = mach_absolute_time(), ns = 0;
++	IOLog("SWEET DIAG v2: %lld clients, %lld buffers alive (%lld ever), %lld MB pool memory, %lld MB imported (surfaces)\n",
++	    (long long)sweet_dg_clients, (long long)sweet_dg_bo_live, (long long)sweet_dg_bo_created,
++	    (long long)(sweet_dg_pool_bytes >> 20), (long long)(sweet_dg_imp_bytes >> 20));
++	for (uint32_t m = 0; m < 32; m++) {
++		struct sweet_dg_method *e = &sweet_dg_m[m];
++		if (e->calls) {
++			IOLog("SWEET DIAG v2 %s(%u): %u calls, %u failed (last rc 0x%x), %u slower than 5 ms, avg %llu us, max %u us\n",
++			    sweet_dg_name(m), m, e->calls, e->fails, e->last_rc, e->slow, e->total_us / e->calls, e->max_us);
++		}
++	}
++	for (unsigned i = 0; i < 6 && sweet_dg_pr[i].nm[0]; i++) {
++		absolutetime_to_nanoseconds(now - sweet_dg_pr[i].last, &ns);
++		IOLog("SWEET DIAG v2 process '%s': %u calls, %u failed, last call %llu ms ago\n", sweet_dg_pr[i].nm,
++		    sweet_dg_pr[i].calls, sweet_dg_pr[i].fails, ns / 1000000);
++	}
++	for (unsigned i = 0; i < 16; i++) {
++		if (sweet_dg_if[i].th != NULL) {
++			absolutetime_to_nanoseconds(now - sweet_dg_if[i].t0, &ns);
++			if (ns > 300000000ULL) {
++				IOLog("SWEET DIAG v2: STUCK '%s' has been inside %s(%u) for %llu ms\n", sweet_dg_if[i].nm,
++				    sweet_dg_name(sweet_dg_if[i].method), sweet_dg_if[i].method, ns / 1000000);
++			}
++		}
++	}
++}
++
+ /* ---- user client ---- */
+ 
+ #define SWEET_GPU_MAX_BUFFERS   4096
+@@ -141,6 +218,7 @@
+ 
+ 	int addMemory(IOMemoryDescriptor *md, uint64_t *handle, uint64_t *va);
+ 	IOReturn v2Method(uint32_t method, const void *in, uint32_t inSize, void *out, uint32_t *outSize);
++	IOReturn v2MethodImpl(uint32_t method, const void *in, uint32_t inSize, void *out, uint32_t *outSize);
+ 	SweetV2BO *v2Find(uint64_t handle);
+ 	IOReturn v2NewSlot(IOMemoryDescriptor *md, uint64_t bytes, bool imported, uint64_t *handle);
+ 	void v2Release(SweetV2BO *bo);
+@@ -260,6 +338,12 @@
+ 		}
+ 		sweet_gpu_lost(&fEpoch, 0);     /* resets before this client do not concern it */
+ 		fV2 = true;
++		OSAddAtomic64(1, &sweet_dg_clients);
++		{
++			char nm[24] = "";
++			proc_selfname(nm, sizeof(nm));
++			IOLog("SWEET DIAG v2: client opened by '%s', window 0x%llx + 0x%llx\n", nm, (unsigned long long)fWinBase, (unsigned long long)fWinSize);
++		}
+ 	}
+ 	return true;
+ }
+@@ -278,6 +362,10 @@
+ 	 * v2: unmapping memory under the GPU would fault, or hand pages to someone else while the GPU still writes
+ 	 * them: wait for this client's last fence first.
+ 	 */
++	if (fV2) {
++		OSAddAtomic64(-1, &sweet_dg_clients);
++		IOLog("SWEET DIAG v2: client closing, %u buffer slots, %llu GPU resets told to it\n", fBOCap, (unsigned long long)fFaults);
++	}
+ 	if (fLastFence != 0 && sweet_gpu_wait_fence_ns(fLastFence, 2000000000ULL)) {
+ 		IOLog("SWEET GPU: client freed with fence %u still pending\n", fLastFence);
+ 	}
+@@ -554,6 +642,9 @@
+ 	fBO[i].iova = 0;
+ 	fBO[i].imported = imported;
+ 	*handle = i + 1;
++	OSAddAtomic64(1, &sweet_dg_bo_live);
++	OSAddAtomic64(1, &sweet_dg_bo_created);
++	OSAddAtomic64((int64_t)bytes, imported ? &sweet_dg_imp_bytes : &sweet_dg_pool_bytes);
+ 	return kIOReturnSuccess;
+ }
+ 
+@@ -627,6 +718,8 @@
+ 	if (bo->md == NULL) {
+ 		return;
+ 	}
++	OSAddAtomic64(-1, &sweet_dg_bo_live);
++	OSAddAtomic64(-(int64_t)bo->bytes, bo->imported ? &sweet_dg_imp_bytes : &sweet_dg_pool_bytes);
+ 	if (bo->iova != 0) {
+ 		sweet_gpu_unmap_at(bo->iova, bo->bytes);
+ 	}
+@@ -647,9 +740,84 @@
+ #define SWEET_A619_UBWC_SWIZZLE 0x6u
+ #define SWEET_A619_UBWC_VERSION 3u
+ 
++/* 0114: times every call, remembers who is inside, logs failures and slow calls */
+ IOReturn
+ SweetGPUUserClient::v2Method(uint32_t method, const void *in, uint32_t inSize, void *out, uint32_t *outSize)
+ {
++	void *th = IOThreadSelf();
++	char who[24] = "";
++	int slot = -1;
++	proc_selfname(who, sizeof(who));
++	for (int i = 0; i < 16; i++) {
++		if (OSCompareAndSwapPtr(NULL, th, (void * volatile *)&sweet_dg_if[i].th)) {
++			slot = i;
++			sweet_dg_if[i].method = method;
++			strlcpy(sweet_dg_if[i].nm, who, sizeof(sweet_dg_if[i].nm));
++			sweet_dg_if[i].t0 = mach_absolute_time();
++			break;
++		}
++	}
++	uint64_t t0 = mach_absolute_time(), ns = 0;
++	uint64_t bytes = 0;
++	if (method == NativeAdrenoMethodBoAlloc && in != NULL && inSize == sizeof(NativeAdrenoAbiBoAlloc)) {
++		bytes = ((const NativeAdrenoAbiBoAlloc *)in)->bytes;
++	} else if (method == NativeAdrenoMethodBoImport && in != NULL && inSize == sizeof(NativeAdrenoAbiBoImport)) {
++		bytes = ((const NativeAdrenoAbiBoImport *)in)->bytes;
++	}
++	IOReturn r = v2MethodImpl(method, in, inSize, out, outSize);
++	absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
++	if (slot >= 0) {
++		__asm__ volatile ("dmb sy" ::: "memory");
++		sweet_dg_if[slot].th = NULL;
++	}
++	uint32_t us = (uint32_t)(ns / 1000);
++	struct sweet_dg_method *e = &sweet_dg_m[method & 31];
++	e->calls++;
++	e->total_us += us;
++	if (us > e->max_us) {
++		e->max_us = us;
++	}
++	if (ns > 5000000ULL) {
++		e->slow++;
++	}
++	struct sweet_dg_proc *pe = NULL;
++	for (unsigned i = 0; i < 6; i++) {
++		if (sweet_dg_pr[i].nm[0] == 0 || strncmp(sweet_dg_pr[i].nm, who, sizeof(who)) == 0) {
++			pe = &sweet_dg_pr[i];
++			strlcpy(pe->nm, who, sizeof(pe->nm));
++			break;
++		}
++	}
++	if (pe != NULL) {
++		pe->calls++;
++		pe->last = mach_absolute_time();
++	}
++	/* a wait that times out is the normal way to poll: only the other failures count */
++	bool bad = r != kIOReturnSuccess && !(method == NativeAdrenoMethodWaitFence && r == kIOReturnTimeout);
++	if (bad) {
++		e->fails++;
++		e->last_rc = (uint32_t)r;
++		if (pe != NULL) {
++			pe->fails++;
++		}
++		if (sweet_dg_fail_logged++ < 80) {
++			IOLog("SWEET DIAG v2: '%s' %s(%u) FAILED rc 0x%x after %u us, input %u bytes, asked for %llu bytes, buffers alive %lld, pool %lld MB, imported %lld MB\n",
++			    who, sweet_dg_name(method), method, (uint32_t)r, us, inSize, bytes, (long long)sweet_dg_bo_live,
++			    (long long)(sweet_dg_pool_bytes >> 20), (long long)(sweet_dg_imp_bytes >> 20));
++			if (sweet_dg_fail_logged <= 3) {
++				sweet_gpu_diag("v2 call failed");
++			}
++		}
++	}
++	if (ns > (method == NativeAdrenoMethodWaitFence ? 100000000ULL : 5000000ULL) && sweet_dg_slow_logged++ < 80) {
++		IOLog("SWEET DIAG v2: '%s' %s(%u) took %u us (asked for %llu bytes) rc 0x%x\n", who, sweet_dg_name(method), method, us, bytes, (uint32_t)r);
++	}
++	return r;
++}
++
++IOReturn
++SweetGPUUserClient::v2MethodImpl(uint32_t method, const void *in, uint32_t inSize, void *out, uint32_t *outSize)
++{
+ 	static uint32_t logged;
+ #define V2_IN(T)        if (in == NULL || inSize != sizeof(T)) return kIOReturnBadArgument; const T *rq = (const T *)in
+ #define V2_OUT(T)       if (out == NULL || *outSize < sizeof(T)) return kIOReturnBadArgument; T *rp = (T *)out; \
+@@ -768,6 +936,9 @@
+ 			r = kIOReturnBusy;
+ 		} else if (rq->iova < fWinBase || rq->iova + bo->bytes > fWinBase + fWinSize || rq->iova + bo->bytes < rq->iova) {
+ 			r = kIOReturnBadArgument;
++			IOLog("SWEET DIAG v2: BoMap refused: iova 0x%llx + 0x%llx outside window 0x%llx + 0x%llx\n",
++			    (unsigned long long)rq->iova, (unsigned long long)bo->bytes, (unsigned long long)fWinBase,
++			    (unsigned long long)fWinSize);
+ 		}
+ 		/* the pages in 4K steps (16K VM pages, any 4K-aligned import), mapped in pieces */
+ 		for (uint64_t off = 0; r == kIOReturnSuccess && off < bo->bytes;) {
+@@ -825,6 +996,8 @@
+ 		V2_IN(NativeAdrenoAbiSubmit);
+ 		V2_OUT(NativeAdrenoAbiSubmitReply);
+ 		if (rq->buffer_count == 0 || rq->buffer_count > NativeAdrenoAbiMaxBuffers || rq->reserved) {
++			IOLog("SWEET DIAG v2: Submit refused: %u buffers (max %u), reserved 0x%llx\n", (unsigned)rq->buffer_count,
++			    (unsigned)NativeAdrenoAbiMaxBuffers, (unsigned long long)rq->reserved);
+ 			return kIOReturnBadArgument;
+ 		}
+ 		uint64_t iova[NativeAdrenoAbiMaxBuffers];
+@@ -833,6 +1006,9 @@
+ 			const NativeAdrenoAbiSubmitBuffer *b = &rq->buffers[i];
+ 			if ((b->bytes & 3) || b->bytes == 0 || b->bytes / 4 > 0xfffff || b->iova < fWinBase ||
+ 			    b->iova + b->bytes > fWinBase + fWinSize) {
++				IOLog("SWEET DIAG v2: Submit refused: buffer %u iova 0x%llx bytes 0x%llx, window 0x%llx + 0x%llx\n", i,
++				    (unsigned long long)b->iova, (unsigned long long)b->bytes, (unsigned long long)fWinBase,
++				    (unsigned long long)fWinSize);
+ 				return kIOReturnBadArgument;
+ 			}
+ 			iova[i] = b->iova;
+@@ -865,7 +1041,10 @@
+ 	case NativeAdrenoMethodGetStatus: {
+ 		V2_OUT(NativeAdrenoAbiStatus);
+ 		if (sweet_gpu_lost(&fEpoch, fLastFence)) {
++			char nm[24] = "";
++			proc_selfname(nm, sizeof(nm));
+ 			fFaults++;
++			IOLog("SWEET DIAG v2: GetStatus tells '%s' the GPU was reset (faults now %llu)\n", nm, (unsigned long long)fFaults);
+ 		}
+ 		rp->faults = fFaults;
+ 		return kIOReturnSuccess;
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -46,6 +46,13 @@
+ #include <IOKit/IOLocks.h>
+ #include <IOKit/IOWorkLoop.h>
+ #include <IOKit/IOTimerEventSource.h>
++
++/* 0114 diagnostics: is the display side alive (vsync, notifications to backboardd, swaps, presents)? */
++extern "C" void sweet_gpu_diag(const char *why);
++extern "C" void sweet_v2_diag_print(void);
++static uint64_t sweet_dg_vs_sent, sweet_dg_vs_nohandler, sweet_dg_vs_noport, sweet_dg_vs_err, sweet_dg_other_sent;
++static uint64_t sweet_dg_swap_begin, sweet_dg_swap_end, sweet_dg_last_swap, sweet_dg_present_n, sweet_dg_present_max_ns, sweet_dg_present_total_ns;
++static int sweet_dg_vs_lasterr;
+ #include <IOKit/system.h>
+ #include <pexpert/pexpert.h>
+ #include <kern/clock.h>
+@@ -212,6 +219,25 @@
+ 	AppleCLCD *fb = (AppleCLCD *)owner;
+ 	uint64_t now = mach_absolute_time();
+ 	uint64_t count = ++fb->fVsyncCount;
++	if (count % 300 == 0 && (count <= 18000 || count % 3000 == 0)) {
++		/* every 5 s for the first 5 minutes, then every 50 s */
++		uint64_t age = 0;
++		unsigned nclients;
++		IOLockLock(fb->fLock);
++		nclients = fb->fClients->getCount();
++		IOLockUnlock(fb->fLock);
++		if (sweet_dg_last_swap != 0) {
++			absolutetime_to_nanoseconds(now - sweet_dg_last_swap, &age);
++		}
++		IOLog("SWEET DIAG fb: vsync %llu, %u clients; vsync notifications sent %llu, no handler registered %llu, no port %llu, send errors %llu (last 0x%x); other notifications %llu; swaps begun %llu ended %llu%s, last swap %llu ms ago%s; presents %llu (avg %llu us, max %llu us); panel dirty %d, off %d\n",
++		    count, nclients, sweet_dg_vs_sent, sweet_dg_vs_nohandler, sweet_dg_vs_noport, sweet_dg_vs_err, sweet_dg_vs_lasterr,
++		    sweet_dg_other_sent, sweet_dg_swap_begin, sweet_dg_swap_end, sweet_dg_swap_begin == sweet_dg_swap_end ? "" : " (SWAP NOT ENDED)",
++		    age / 1000000, sweet_dg_last_swap != 0 && age > 3000000000ULL ? " STALLED" : "", sweet_dg_present_n,
++		    sweet_dg_present_n ? sweet_dg_present_total_ns / sweet_dg_present_n / 1000 : 0, sweet_dg_present_max_ns / 1000,
++		    (int)fb->fDirty, (int)fb->fPowerOff);
++		sweet_v2_diag_print();
++		sweet_gpu_diag("heartbeat");
++	}
+ 	uint64_t values[6] = {
+ 		(uint32_t)count, (uint32_t)(count >> 32),
+ 		(uint32_t)now, (uint32_t)(now >> 32),
+@@ -253,7 +279,14 @@
+ 	}
+ 	IOLockUnlock(fb->fLock);
+ 	if (rec != NULL) {
++		uint64_t pt0 = mach_absolute_time(), pns = 0;
+ 		fb->present(rec);
++		absolutetime_to_nanoseconds(mach_absolute_time() - pt0, &pns);
++		sweet_dg_present_n++;
++		sweet_dg_present_total_ns += pns;
++		if (pns > sweet_dg_present_max_ns) {
++			sweet_dg_present_max_ns = pns;
++		}
+ 		IOFreeData(rec, SWEET_FB_SWAP_REC_SIZE);
+ 	}
+ 	sender->setTimeoutUS(SWEET_FB_VSYNC_US);
+@@ -315,6 +348,7 @@
+ 	IOLockLock(fLock);
+ 	memcpy(fPending, rec, SWEET_FB_SWAP_REC_SIZE);
+ 	sweet_fb_swap_fence = sweet_gpu_v2_newest_fence();
++	sweet_dg_last_swap = mach_absolute_time();
+ 	fDirty = true;
+ 	IOLockUnlock(fLock);
+ 	if ((++sweet_fb_swap_count % 1000) == 0) {
+@@ -537,13 +571,31 @@
+ {
+ 	OSAsyncReference64 ref;
+ 
+-	if (type >= SWEET_FB_NOTIFY_TYPES || fFunc[type] == 0 || fPort == MACH_PORT_NULL) {
++	if (type >= SWEET_FB_NOTIFY_TYPES || fFunc[type] == 0) {
++		if (type == SWEET_FB_NOTIFY_VSYNC) {
++			sweet_dg_vs_nohandler++;
++		}
++		return;
++	}
++	if (fPort == MACH_PORT_NULL) {
++		if (type == SWEET_FB_NOTIFY_VSYNC) {
++			sweet_dg_vs_noport++;
++		}
+ 		return;
+ 	}
+ 	bzero(ref, sizeof(ref));
+ 	setAsyncReference64(ref, fPort, (mach_vm_address_t)fFunc[type], fRefcon[type], fTask);
+-	sendAsyncResult64WithOptions(ref, kIOReturnSuccess, (io_user_reference_t *)values, count,
++	IOReturn nr = sendAsyncResult64WithOptions(ref, kIOReturnSuccess, (io_user_reference_t *)values, count,
+ 	    kIOUserNotifyOptionCanDrop);
++	if (type == SWEET_FB_NOTIFY_VSYNC) {
++		sweet_dg_vs_sent++;
++		if (nr != kIOReturnSuccess) {
++			sweet_dg_vs_err++;
++			sweet_dg_vs_lasterr = (int)nr;
++		}
++	} else {
++		sweet_dg_other_sent++;
++	}
+ }
+ 
+ static uint64_t sweet_fb_logged;        /* selectors already logged (< 64) */
+@@ -563,12 +615,14 @@
+ 		outCount = 1;
+ 		break;
+ 	case kSweetFBSwapBegin:
++		sweet_dg_swap_begin++;
+ 		IOLockLock(fFB->fLock);
+ 		out[0] = ++fFB->fSwapID;
+ 		IOLockUnlock(fFB->fLock);
+ 		outCount = 1;
+ 		break;
+ 	case kSweetFBSwapEnd: {
++		sweet_dg_swap_end++;
+ 		uint8_t rec[SWEET_FB_SWAP_REC_SIZE];
+ 		if (args->structureInputDescriptor != NULL ||
+ 		    args->structureInputSize < SWEET_FB_SWAP_REC_SIZE) {
