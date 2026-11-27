@@ -209,6 +209,33 @@ jobs:
             git apply "$f"
           done
 
+      - name: Linear texture rows Turnip can use in place
+        run: |
+          cd flame
+          python3 - <<'PY'
+          # CoreAnimation lays out the rows of a texture it makes over a no-copy buffer (a CPU-drawn layer's backing store) by
+          # minimumLinearTextureAlignmentForPixelFormat:. The bridge answers 16 bytes (an M-series Mac's answer), but Turnip
+          # only makes a linear image in place when rows are 64-byte multiples: a 194x237 layer with 784-byte rows got a
+          # shadow image, copied in before every use and back after every write one 2D blit per row (237 blits a copy).
+          p = 'phone/metal2/bridge/NativeMetalObjects.rs'
+          s = open(p).read()
+          old = '''        "deviceLinearReadOnlyTextureAlignmentBytes" => {
+                      device.private().count(PrivateCount::DeviceLinearTextureAlignmentBytes).value().ok_or_else(none)?
+                  }'''
+          new = '''        "deviceLinearReadOnlyTextureAlignmentBytes" => {
+                      device.private().count(PrivateCount::DeviceLinearTextureAlignmentBytes).value().ok_or_else(none)?.max(64)
+                  }'''
+          assert s.count(old) == 1, 'deviceLinearReadOnlyTextureAlignmentBytes arm not found'
+          s = s.replace(old, new)
+          old = '''            .map_err(e("minimum linear texture alignment"))?,'''
+          new = '''            .map_err(e("minimum linear texture alignment"))?
+                      .max(64),'''
+          assert s.count(old) == 1, 'minimumLinearTextureAlignmentForPixelFormat: arm not found'
+          s = s.replace(old, new)
+          open(p, 'w').write(s)
+          PY
+          grep -n -A3 '"minimumLinearTextureAlignmentForPixelFormat:"\|"deviceLinearReadOnlyTextureAlignmentBytes"' phone/metal2/bridge/NativeMetalObjects.rs
+
       - name: Build the bridge for iOS 16
         run: |
           cd flame
