@@ -56,6 +56,8 @@ if [[ -d $stage/SweetMetal2.bundle ]]; then
 	rm -rf "$mnt/System/Library/Extensions/SweetMetal2.bundle"
 	cp -a "$stage/SweetMetal2.bundle" "$mnt/System/Library/Extensions/"
 	chown -R 0:0 "$mnt/System/Library/Extensions/SweetMetal2.bundle"
+	# rm first: with M2V_DIAG it is a link to /dev/console, and install would follow it to the host's /dev/console
+	rm -f "$mnt/private/var/local/mtl2.log"
 	install -o 0 -g 0 -m 666 /dev/null "$mnt/private/var/local/mtl2.log"
 	printf 'SpringBoard\n' > "$mnt/private/var/local/mtl2-clients"
 	chown 0:0 "$mnt/private/var/local/mtl2-clients"; chmod 644 "$mnt/private/var/local/mtl2-clients"
@@ -65,6 +67,23 @@ if [[ -n ${TU_DEBUG_OPTS:-} ]]; then
 	printf '%s\n' "$TU_DEBUG_OPTS" > "$mnt/private/var/local/mtl2-tu-debug"; chmod 644 "$mnt/private/var/local/mtl2-tu-debug"
 else
 	rm -f "$mnt/private/var/local/mtl2-tu-debug"
+fi
+# optional: M2V_DIAG=1 sudo ./metal-install.sh ...  -> the bridge's own reports on the console (no rebuild): its degrade
+# notices (each copy, extra pass or stand-in it adds where Metal pays none, once per kind) and backboardd's telemetry every
+# 10 s (per command buffer: render passes, draws, pixels, dispatches and the blits Metal itself asked for). MTL2 lines
+# then show up twice on the console (once through the mtl2.log link).
+env_line='SWEET_M2V_MESSAGES=/dev/console'
+if [[ -n ${M2V_DIAG:-} ]]; then
+	rm -f "$mnt/private/var/local/mtl2.log"
+	ln -s /dev/console "$mnt/private/var/local/mtl2.log"
+	install -o 0 -g 0 -m 644 /dev/null "$mnt/private/var/local/mtl2-telemetry"
+	printf '%s\n' "$env_line" > "$mnt/private/var/local/mtl2-env"; chown 0:0 "$mnt/private/var/local/mtl2-env"; chmod 644 "$mnt/private/var/local/mtl2-env"
+else
+	rm -f "$mnt/private/var/local/mtl2-telemetry"
+	# only the file this option writes (one written by hand stays)
+	if [[ -f $mnt/private/var/local/mtl2-env && $(cat "$mnt/private/var/local/mtl2-env") == "$env_line" ]]; then
+		rm -f "$mnt/private/var/local/mtl2-env"
+	fi
 fi
 fi
 
