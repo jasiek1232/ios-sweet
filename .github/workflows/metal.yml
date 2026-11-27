@@ -12,8 +12,11 @@ on:
         description: ios-flame commit to take the userland sources from
         default: 745c4341af86089efb0df851fa8a27fb8face624
       unixnu_ref:
-        description: UniXNU ref that the Mesa patches (patches/mesa) come from
-        default: main
+        description: UniXNU commit or branch that the Mesa patches (patches/mesa) come from
+        default: e7bddb9a7eecdcf81f36da9fa38bd9d4d3f155c2
+      mesa_patches:
+        description: "which UniXNU Mesa patches: all (UniXNU's whole list, scripts/data/adreno-compiler-inputs.json) or flame8 (the eight ios-flame was built with)"
+        default: all
       runner:
         description: "runner label: macos-15 (GitHub arm64), macos-15-intel, or self-hosted (your own Mac or macOS VM)"
         default: macos-15
@@ -26,7 +29,9 @@ env:
   FLAME_REPO: https://github.com/NWylynko/ios-flame
   FLAME_SHA: ${{ inputs.flame_sha || '745c4341af86089efb0df851fa8a27fb8face624' }}
   UNIXNU_REPO: https://github.com/UniXNU/UniXNU
-  UNIXNU_REF: ${{ inputs.unixnu_ref || 'main' }}
+  # pinned: the patch list and the ABI shim below were checked against this commit (2026-11-26)
+  UNIXNU_REF: ${{ inputs.unixnu_ref || 'e7bddb9a7eecdcf81f36da9fa38bd9d4d3f155c2' }}
+  MESA_PATCHES: ${{ inputs.mesa_patches || 'all' }}
   MESA_SHA: 85fda3b36405bcaea8bffc64aa4f2651dc90770d
   M2V_SHA: 720ef1ce
   RUST_VERSION: 1.98.0
@@ -64,16 +69,28 @@ jobs:
 
       - name: Fetch UniXNU's Mesa patches
         run: |
-          git clone -q --depth 1 --filter=blob:none --sparse --branch "$UNIXNU_REF" "$UNIXNU_REPO" unixnu
-          git -C unixnu sparse-checkout set patches/mesa
-          git -C unixnu log -1 --format='UniXNU %h %s'
+          # a commit (pinned) or a branch name
+          git clone -q --filter=blob:none --sparse --no-checkout "$UNIXNU_REPO" unixnu
+          git -C unixnu sparse-checkout set patches/mesa scripts/data
+          git -C unixnu checkout -q "$UNIXNU_REF"
+          git -C unixnu log -1 --format='UniXNU %h %cd %s'
 
       - name: Apply Mesa patches
         run: |
           cd flame/work/turnip/mesa
-          # the eight patches ios-flame builds with, in UniXNU's order (scripts/data/adreno-compiler-inputs.json)
-          for p in freedreno-tools-nir ir3-darwin-build-id ir3-portable-asm-roundtrip offline-adreno-compiler-probe \
-                   turnip-darwin-kmd turnip-graphics-cache-feedback turnip-empty-scissor turnip-builtin-shader-pack; do
+          if [ "$MESA_PATCHES" = flame8 ]; then
+            # the eight patches ios-flame builds with, in UniXNU's order
+            list="freedreno-tools-nir ir3-darwin-build-id ir3-portable-asm-roundtrip offline-adreno-compiler-probe
+                  turnip-darwin-kmd turnip-graphics-cache-feedback turnip-empty-scissor turnip-builtin-shader-pack"
+          else
+            # UniXNU's whole list in its order: the same first eight, then its Turnip work for imported surfaces and speed:
+            # images over host imports without a dedicated allocation (no copy of the screen surface into a shadow image
+            # and back each frame), GMEM loads/stores of unpadded linear surfaces, the colour swap of linear images in
+            # tile memory, BO cache sweeps off the hot path, shaders shared between pipeline caches, submit cuts, ...
+            list=$(python3 -c 'import json,os; print(" ".join(os.path.basename(p)[:-6] for p in json.load(open(os.environ["GITHUB_WORKSPACE"]+"/unixnu/scripts/data/adreno-compiler-inputs.json"))["patches"]))')
+          fi
+          echo "Mesa patches ($MESA_PATCHES): $list"
+          for p in $list; do
             f=$GITHUB_WORKSPACE/unixnu/patches/mesa/$p.patch
             echo "== $p"
             git apply --check "$f" || { echo "::error::$p does not apply"; exit 1; }
@@ -109,9 +126,19 @@ jobs:
           a = "    NativeAdrenoParamsHostImport = 1  /*"
           assert s.count(a) == 1, 'params flag enum not found'
           s = s.replace(a, "    NativeAdrenoParamsOwnedCoherent = 2, /* newer backends: BOs are IO-coherent (never set by our kernel) */\n    NativeAdrenoParamsHostImport = 1  /*")
+          # UniXNU's later patches (gmem-mutable-swap and on) also call two methods ios-flame's header lacks: SetPriority (the
+          # process's GPU priority) and Note (a line for the kernel's log). Our kernel refuses both (unknown method: an error the
+          # backend ignores), so only the names and records have to exist.
+          a = "    NativeAdrenoMethodBoImport = 16,\n"
+          assert s.count(a) == 1, 'BoImport method not found'
+          s = s.replace(a, a + "    NativeAdrenoMethodSetPriority = 17, /* newer backends: refused by our kernel */\n    NativeAdrenoMethodNote = 18,        /* newer backends: refused by our kernel */\n    NativeAdrenoNoteWords = 16,\n")
+          a = "#if defined(__cplusplus)\nstatic_assert"
+          assert s.count(a) == 1, 'static_assert block not found'
+          s = s.replace(a, "struct NativeAdrenoAbiPriority {\n    uint32_t foreground;\n    uint32_t background;\n};\n"
+                           "struct NativeAdrenoAbiNote {\n    uint32_t kind;\n    uint32_t count;\n    uint32_t words[NativeAdrenoNoteWords];\n};\n" + a)
           open(p, 'w').write(s)
           PY
-          grep -n "OwnedCoherent" phone/turnip/NativeAdrenoABI.h
+          grep -n "OwnedCoherent\|SetPriority\|MethodNote\|AbiPriority\|AbiNote" phone/turnip/NativeAdrenoABI.h
 
       - name: Build Turnip for iOS 16
         run: |
