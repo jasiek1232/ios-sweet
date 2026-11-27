@@ -1,0 +1,592 @@
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -111,6 +111,7 @@
+ bsd/dev/sweet_touch_gt9916.c		standard
+ bsd/dev/sweet_gpu_a619.c		standard
+ bsd/dev/sweet_rpmh.c			standard
++bsd/dev/sweet_rpm.c			standard
+ bsd/dev/sweet_spmi.c			standard
+ bsd/dev/sweet_usb.c			standard
+ bsd/dev/mem.c				standard
+--- /dev/null
++++ b/bsd/dev/sweet_rpm.c
+@@ -0,0 +1,468 @@
++/*
++ * SWEET (miami, SM6375): a minimal client of the RPM, the processor that owns this SoC's shared power rails.
++ *
++ * SM6375 has no RPMh (no apps RSC at 0x18220000: sweet_rpmh.c's first read of it hung, log83). Its live DT has
++ * qcom,rpm-smd + qcom,glink-rpm instead: requests go to the RPM over GLINK through the RPM message RAM
++ * (memory@045f0000, 0x7000 bytes), and each write to the TX FIFO is announced through the IPCC mailbox
++ * (qcom,ipcc@208000, mboxes = <&ipcc 0 0>: client AOP, signal GLINK_QMP). This follows mainline Linux:
++ * drivers/rpmsg/qcom_glink_rpm.c (TOC and FIFOs), qcom_glink_native.c (version, open, intentless TX_DATA),
++ * drivers/soc/qcom/smd-rpm.c (request and ack format) and drivers/pmdomain/qcom/rpmpd.c (rwgx/rwmx, swen/vlvl).
++ *
++ * Thread context only, polled (no interrupt), one caller (the GPU bring-up). Every step is logged and every wait
++ * has a deadline: on any surprise it gives up and the caller keeps the boot-time clock.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <kern/clock.h>
++#include <machine/machine_routines.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++int sweet_rpm_write(uint32_t set, uint32_t type, uint32_t id, uint32_t key, uint32_t value);
++int sweet_rpm_gpu_vote(unsigned level);
++
++#define RM_RAM_PA       0x045f0000u
++#define RM_RAM_SIZE     0x7000u
++#define RM_IPCC_PA      0x00208000u
++#define RM_IPCC_SEND    0x0cu
++#define RM_IPCC_HWIRQ   0u              /* client 0 (AOP) << 16 | signal 0 (GLINK_QMP) */
++#define RM_TOC_SIZE     256u
++#define RM_TOC_MAGIC    0x67727430u     /* "grt0" */
++#define RM_TX_ID        0x61703272u     /* "ap2r" */
++#define RM_RX_ID        0x72326170u     /* "r2ap" */
++
++#define GL_VERSION      0
++#define GL_VERSION_ACK  1
++#define GL_OPEN         2
++#define GL_CLOSE        3
++#define GL_OPEN_ACK     4
++#define GL_INTENT       5
++#define GL_RX_DONE      6
++#define GL_TX_DATA      9
++#define GL_CLOSE_ACK    11
++#define GL_TX_DATA_CONT 12
++#define GL_READ_NOTIF   13
++#define GL_RX_DONE_REUSE 14
++#define GL_SIGNALS      15
++
++#define RPM_REQ         0x00716572u     /* "req\0" */
++#define RPM_MSG_ERR     0x00727265u     /* "err\0" */
++#define RPM_MSG_ID      0x2367736du     /* "msg#" */
++#define RPM_RWGX        0x78677772u     /* "rwgx" */
++#define RPM_RWMX        0x786d7772u     /* "rwmx" */
++#define RPM_KEY_SWEN    0x6e657773u     /* "swen" */
++#define RPM_KEY_VLVL    0x6c766c76u     /* "vlvl" */
++
++#define RM_NAME         "rpm_requests"
++#define RM_LCID         1u
++
++static vm_offset_t rm_ram, rm_ipcc;
++static uint32_t rm_tx, rm_tx_len, rm_rx, rm_rx_len;     /* descriptor offsets in the message RAM, FIFO lengths */
++static int rm_state;                                    /* 0 not tried, 1 ready, -1 failed */
++static uint32_t rm_rcid;
++static bool rm_ver, rm_ver_ack, rm_open, rm_open_ack;
++static uint32_t rm_msg_id = 1;
++/* the RPM's answer to the request in flight */
++static bool rm_ack_seen;
++static int rm_ack_status;
++static uint32_t rm_ack_id;
++
++static uint32_t
++rm_rd(uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(rm_ram + off);
++	__asm__ volatile ("dmb oshld" ::: "memory");
++	return v;
++}
++
++static void
++rm_wr(uint32_t off, uint32_t v)
++{
++	__asm__ volatile ("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(rm_ram + off) = v;
++}
++
++static void
++rm_kick(void)
++{
++	__asm__ volatile ("dsb sy" ::: "memory");
++	*(volatile uint32_t *)(rm_ipcc + RM_IPCC_SEND) = RM_IPCC_HWIRQ;
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
++/* FIFO descriptor: +0 tail (reader's index), +4 head (writer's index), +8 data; indices in bytes */
++static uint32_t
++rm_rx_avail(void)
++{
++	uint32_t head = rm_rd(rm_rx + 4), tail = rm_rd(rm_rx);
++	if (head >= rm_rx_len || tail >= rm_rx_len) {
++		return 0xffffffffu;
++	}
++	return head < tail ? rm_rx_len - tail + head : head - tail;
++}
++
++static void
++rm_rx_peek(void *buf, uint32_t off, uint32_t n)
++{
++	uint32_t *w = (uint32_t *)buf;
++	uint32_t t = rm_rd(rm_rx) + off;
++	while (t >= rm_rx_len) {
++		t -= rm_rx_len;
++	}
++	for (uint32_t i = 0; i < n / 4; i++) {
++		w[i] = rm_rd(rm_rx + 8 + t);
++		t += 4;
++		if (t >= rm_rx_len) {
++			t -= rm_rx_len;
++		}
++	}
++}
++
++static void
++rm_rx_advance(uint32_t n)
++{
++	uint32_t t = rm_rd(rm_rx) + n;
++	while (t >= rm_rx_len) {
++		t -= rm_rx_len;
++	}
++	rm_wr(rm_rx, t);
++}
++
++/* nbytes: a multiple of 8 (GLINK pads every message to 8) */
++static int
++rm_tx_write(const uint32_t *words, uint32_t nbytes)
++{
++	for (int spin = 0; spin < 1000; spin++) {
++		uint32_t head = rm_rd(rm_tx + 4), tail = rm_rd(rm_tx);
++		if (head >= rm_tx_len || tail >= rm_tx_len) {
++			printf("SWEET RPM: TX FIFO indices out of range (head %u tail %u length %u)\n", head, tail, rm_tx_len);
++			return EIO;
++		}
++		uint32_t avail = tail <= head ? rm_tx_len - head + tail : tail - head;
++		if (avail > nbytes) {
++			for (uint32_t i = 0; i < nbytes / 4; i++) {
++				rm_wr(rm_tx + 8 + head, words[i]);
++				head += 4;
++				if (head >= rm_tx_len) {
++					head -= rm_tx_len;
++				}
++			}
++			rm_wr(rm_tx + 4, head);
++			rm_kick();
++			return 0;
++		}
++		delay(100);
++	}
++	printf("SWEET RPM: TX FIFO stayed full for 100 ms\n");
++	return ETIMEDOUT;
++}
++
++static int
++rm_send_cmd(uint16_t cmd, uint16_t p1, uint32_t p2)
++{
++	uint32_t m[2] = { (uint32_t)cmd | ((uint32_t)p1 << 16), p2 };
++	return rm_tx_write(m, 8);
++}
++
++static void
++rm_handle_rpm_data(const uint8_t *d, uint32_t n)
++{
++	/* hdr { service_type, length } then messages { type, length, payload } */
++	if (n < 8) {
++		return;
++	}
++	uint32_t svc = *(const uint32_t *)d, len = *(const uint32_t *)(d + 4);
++	if (svc != RPM_REQ || len + 8 > n) {
++		printf("SWEET RPM: answer with service 0x%x length %u (of %u bytes)\n", svc, len, n);
++		return;
++	}
++	int status = 0;
++	uint32_t id = 0;
++	uint32_t p = 8;
++	while (p + 8 <= 8 + len) {
++		uint32_t type = *(const uint32_t *)(d + p), ml = *(const uint32_t *)(d + p + 4);
++		if (p + 8 + ml > n) {
++			break;
++		}
++		if (type == RPM_MSG_ID && ml >= 4) {
++			id = *(const uint32_t *)(d + p + 8);
++		} else if (type == RPM_MSG_ERR) {
++			char e[48];
++			uint32_t k = ml < sizeof(e) - 1 ? ml : (uint32_t)sizeof(e) - 1;
++			memcpy(e, d + p + 8, k);
++			e[k] = 0;
++			printf("SWEET RPM: the RPM refused message %u: \"%s\"\n", id, e);
++			status = EINVAL;
++		}
++		p += 8 + ((ml + 3u) & ~3u);
++	}
++	rm_ack_seen = true;
++	rm_ack_status = status;
++	rm_ack_id = id;
++}
++
++/* Processes what the RPM sent so far. Returns 0, or an error on something this client does not understand. */
++static int
++rm_poll_rx(void)
++{
++	static uint32_t data32[128];
++	uint8_t *data = (uint8_t *)data32;
++	for (int guard = 0; guard < 64; guard++) {
++		uint32_t avail = rm_rx_avail();
++		if (avail == 0xffffffffu) {
++			printf("SWEET RPM: RX FIFO indices out of range\n");
++			return EIO;
++		}
++		if (avail < 8) {
++			return 0;
++		}
++		uint32_t m[4];
++		rm_rx_peek(m, 0, 8);
++		uint32_t cmd = m[0] & 0xffff, p1 = m[0] >> 16, p2 = m[1];
++		switch (cmd) {
++		case GL_VERSION:
++			printf("SWEET RPM: the RPM speaks GLINK version %u, features 0x%x\n", p1, p2);
++			rm_rx_advance(8);
++			rm_ver = true;
++			if (rm_send_cmd(GL_VERSION_ACK, 1, 0)) {
++				return EIO;
++			}
++			break;
++		case GL_VERSION_ACK:
++			printf("SWEET RPM: version ack %u, features 0x%x\n", p1, p2);
++			rm_rx_advance(8);
++			rm_ver_ack = true;
++			break;
++		case GL_OPEN: {
++			uint32_t nl = p2 & 0xffff, tot = (8 + nl + 7) & ~7u;
++			if (nl == 0 || nl > 32) {
++				printf("SWEET RPM: open with a %u-byte name\n", nl);
++				return EIO;
++			}
++			if (avail < tot) {
++				return 0;
++			}
++			char name[40];
++			uint32_t w[10];
++			rm_rx_peek(w, 8, (nl + 3) & ~3u);
++			memcpy(name, w, nl);
++			name[nl < sizeof(name) ? nl - 1 : sizeof(name) - 1] = 0;
++			rm_rx_advance(tot);
++			printf("SWEET RPM: the RPM opened channel %u \"%s\"\n", p1, name);
++			if (strcmp(name, RM_NAME) == 0) {
++				rm_rcid = p1;
++				rm_open = true;
++			}
++			if (rm_send_cmd(GL_OPEN_ACK, (uint16_t)p1, 0)) {
++				return EIO;
++			}
++			break;
++		}
++		case GL_OPEN_ACK:
++			rm_rx_advance(8);
++			if (p1 == RM_LCID) {
++				printf("SWEET RPM: the RPM acknowledged our open of \"%s\"\n", RM_NAME);
++				rm_open_ack = true;
++			}
++			break;
++		case GL_TX_DATA:
++		case GL_TX_DATA_CONT: {
++			if (avail < 16) {
++				return 0;
++			}
++			rm_rx_peek(m, 0, 16);
++			uint32_t chunk = m[2], left = m[3], tot = (16 + chunk + 7) & ~7u;
++			if (chunk > sizeof(data32) || left != 0) {
++				printf("SWEET RPM: %u+%u byte message (too big)\n", chunk, left);
++				return EIO;
++			}
++			if (avail < tot) {
++				return 0;
++			}
++			rm_rx_peek(data, 16, (chunk + 3) & ~3u);
++			rm_rx_advance(tot);
++			if (p1 == rm_rcid && rm_open) {
++				rm_handle_rpm_data(data, chunk);
++			} else {
++				printf("SWEET RPM: %u bytes on channel %u (not ours)\n", chunk, p1);
++			}
++			break;
++		}
++		case GL_READ_NOTIF:
++			rm_rx_advance(8);
++			rm_kick();
++			break;
++		case GL_SIGNALS:
++		case GL_CLOSE:
++		case GL_CLOSE_ACK:
++		case GL_RX_DONE:
++		case GL_RX_DONE_REUSE:
++			printf("SWEET RPM: GLINK command %u (%u, 0x%x) ignored\n", cmd, p1, p2);
++			rm_rx_advance(8);
++			break;
++		case GL_INTENT: {
++			uint32_t tot = (8 + 8 * p2 + 7) & ~7u;
++			if (p2 > 32) {
++				return EIO;
++			}
++			if (avail < tot) {
++				return 0;
++			}
++			rm_rx_advance(tot);
++			break;
++		}
++		default:
++			printf("SWEET RPM: unknown GLINK command %u (%u, 0x%x)\n", cmd, p1, p2);
++			return EIO;
++		}
++	}
++	return 0;
++}
++
++static int
++rm_init(void)
++{
++	if (rm_state) {
++		return rm_state > 0 ? 0 : ENODEV;
++	}
++	rm_state = -1;
++	rm_ram = ml_io_map(RM_RAM_PA, RM_RAM_SIZE);
++	rm_ipcc = ml_io_map(RM_IPCC_PA, 0x1000);
++	if (!rm_ram || !rm_ipcc) {
++		printf("SWEET RPM: mapping failed\n");
++		return ENOMEM;
++	}
++	uint32_t toc = RM_RAM_SIZE - RM_TOC_SIZE;
++	printf("SWEET RPM: reading the message RAM's table of contents at %#x ...\n", RM_RAM_PA + toc);
++	uint32_t magic = rm_rd(toc), count = rm_rd(toc + 4);
++	printf("SWEET RPM: TOC magic 0x%08x, %u entries\n", magic, count);
++	if (magic != RM_TOC_MAGIC || count > (RM_TOC_SIZE - 8) / 12) {
++		printf("SWEET RPM: no GLINK table of contents\n");
++		return ENODEV;
++	}
++	for (uint32_t i = 0; i < count; i++) {
++		uint32_t id = rm_rd(toc + 8 + 12 * i), off = rm_rd(toc + 12 + 12 * i), size = rm_rd(toc + 16 + 12 * i);
++		printf("SWEET RPM: TOC entry 0x%08x at %#x, %u bytes\n", id, off, size);
++		if (off > RM_RAM_SIZE || size > RM_RAM_SIZE - off || size < 64 || (size & 7) || (off & 3)) {
++			continue;
++		}
++		if (id == RM_TX_ID) {
++			rm_tx = off;
++			rm_tx_len = size;
++		} else if (id == RM_RX_ID) {
++			rm_rx = off;
++			rm_rx_len = size;
++		}
++	}
++	if (!rm_tx_len || !rm_rx_len) {
++		printf("SWEET RPM: no TX/RX FIFO in the TOC\n");
++		return ENODEV;
++	}
++	/* as qcom_glink_rpm.c probes: our write index and our read index start over */
++	rm_wr(rm_tx + 4, 0);
++	rm_wr(rm_rx, 0);
++	printf("SWEET RPM: FIFOs reset (TX tail %u, RX head %u); sending version ...\n", rm_rd(rm_tx), rm_rd(rm_rx + 4));
++	if (rm_send_cmd(GL_VERSION, 1, 0)) {
++		return EIO;
++	}
++	bool opened = false;
++	for (int ms = 0; ms < 2000; ms++) {
++		if (rm_poll_rx()) {
++			return EIO;
++		}
++		if (!opened && (rm_ver_ack || rm_ver)) {
++			/* OPEN: lcid, name length (with its NUL), then the name, padded to 8 */
++			uint32_t w[6] = { 0 };
++			w[0] = GL_OPEN | (RM_LCID << 16);
++			w[1] = sizeof(RM_NAME);
++			memcpy(&w[2], RM_NAME, sizeof(RM_NAME));
++			printf("SWEET RPM: opening \"%s\" ...\n", RM_NAME);
++			if (rm_tx_write(w, (8 + sizeof(RM_NAME) + 7) & ~7u)) {
++				return EIO;
++			}
++			opened = true;
++		}
++		if (opened && rm_open && rm_open_ack) {
++			printf("SWEET RPM: channel ready after %d ms (RPM side id %u)\n", ms, rm_rcid);
++			rm_state = 1;
++			return 0;
++		}
++		delay(1000);
++	}
++	printf("SWEET RPM: no answer in 2 s (version %d/%d, open %d/%d)\n", rm_ver, rm_ver_ack, rm_open, rm_open_ack);
++	return ETIMEDOUT;
++}
++
++/* One key/value request to an RPM resource; set 0 = active, 1 = sleep. Waits for the RPM's answer (1 s). */
++int
++sweet_rpm_write(uint32_t set, uint32_t type, uint32_t id, uint32_t key, uint32_t value)
++{
++	if (rm_init()) {
++		return ENODEV;
++	}
++	uint32_t msg_id = rm_msg_id++;
++	/* GLINK TX_DATA (16) + RPM header (8) + request (20) + key/value (12) = 56 bytes */
++	uint32_t w[14] = {
++		GL_TX_DATA | (RM_LCID << 16), 0, 40, 0,
++		RPM_REQ, 20 + 12,
++		msg_id, set, type, id, 12,
++		key, 4, value,
++	};
++	rm_ack_seen = false;
++	if (rm_tx_write(w, sizeof(w))) {
++		return EIO;
++	}
++	for (int ms = 0; ms < 1000; ms++) {
++		if (rm_poll_rx()) {
++			return EIO;
++		}
++		if (rm_ack_seen && rm_ack_id == msg_id) {
++			return rm_ack_status;
++		}
++		delay(1000);
++	}
++	printf("SWEET RPM: no answer to message %u in 1 s\n", msg_id);
++	return ETIMEDOUT;
++}
++
++static const char *
++rm_fourcc(uint32_t v, char *b)
++{
++	for (int i = 0; i < 4; i++) {
++		char c = (char)(v >> (8 * i));
++		b[i] = (c >= 32 && c < 127) ? c : '?';
++	}
++	b[4] = 0;
++	return b;
++}
++
++static int
++rm_vote(uint32_t type, uint32_t key, uint32_t value)
++{
++	char t[5], k[5];
++	int rc = sweet_rpm_write(0, type, 0, key, value);
++	printf("SWEET RPM: %s0 %s = %u -> %s (%d)\n", rm_fourcc(type, t), rm_fourcc(key, k), value, rc ? "FAILED" : "ok", rc);
++	return rc;
++}
++
++/*
++ * The GPU's voltage for a DT level (qcom,level: 256 NOM, 320 NOM_L1, 384 TURBO, 416 TURBO_L1): MX first (GX's
++ * parent in rpmpd.c, kept at least TURBO, where the boot left it), then GX on at that level. Active set only.
++ */
++int
++sweet_rpm_gpu_vote(unsigned level)
++{
++	unsigned mx = level > 384 ? level : 384;
++	if (rm_vote(RPM_RWMX, RPM_KEY_VLVL, mx)) {
++		return EIO;
++	}
++	if (rm_vote(RPM_RWGX, RPM_KEY_SWEN, 1)) {
++		return EIO;
++	}
++	if (rm_vote(RPM_RWGX, RPM_KEY_VLVL, level)) {
++		return EIO;
++	}
++	return 0;
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+--- a/bsd/dev/sweet_gpu_a619.c
++++ b/bsd/dev/sweet_gpu_a619.c
+@@ -225,9 +225,66 @@
+ 	__asm__ volatile ("dsb sy" ::: "memory");
+ }
+ 
++/*
++ * 0121: sweetgpumhz=N raises the GPU clock to one of the frequencies of this chip's DT table (qcom,gpu-pwrlevels for
++ * its speed bin, the qfprom byte at 0x1b46015), after the RPM has raised the GPU rail (rwgx) to that frequency's
++ * qcom,level. As mainline gpucc-sm6375: PLL0 at twice the frequency, the GX_GFX3D RCG /2. Anything that does not
++ * work out (unknown bin, frequency not in its table, the RPM not answering) leaves the boot-time clock.
++ */
++int sweet_rpm_gpu_vote(unsigned level);
++
++struct g_opp { uint32_t mhz, level; };
++static const struct g_opp g_opp_900[] = { { 900, 416 }, { 840, 384 }, { 770, 320 }, { 650, 256 }, { 0, 0 } };
++static const struct g_opp g_opp_840[] = { { 840, 384 }, { 770, 320 }, { 650, 256 }, { 0, 0 } };
++static const struct g_opp g_opp_700[] = { { 700, 320 }, { 650, 256 }, { 0, 0 } };
++static const struct g_opp g_opp_any[] = { { 650, 256 }, { 0, 0 } };
++
++static bool
++g_gpu_fast_clock(uint32_t *pll_l, uint32_t *pll_alpha, uint32_t *mhz_out)
++{
++	uint32_t mhz = 0;
++	if (!PE_parse_boot_argn("sweetgpumhz", &mhz, sizeof(mhz)) || mhz == 0) {
++		return false;
++	}
++	vm_offset_t q = ml_io_map(0x01b46000, 0x1000);
++	uint32_t bin = q ? (*(volatile uint32_t *)(q + 0x14) >> 8) & 0xffu : 0xffffffffu;
++	const struct g_opp *opp;
++	switch (bin) {
++	case 0: case 190: opp = g_opp_900; break;
++	case 177: opp = g_opp_840; break;
++	case 148: opp = g_opp_700; break;
++	default: opp = g_opp_any; break;
++	}
++	uint32_t level = 0;
++	for (int i = 0; opp[i].mhz; i++) {
++		if (opp[i].mhz == mhz) {
++			level = opp[i].level;
++		}
++	}
++	printf("SWEET GPUK: sweetgpumhz=%u: GPU speed bin %u, %s\n", mhz, bin,
++	    level ? "in its frequency table" : "NOT in its frequency table (allowed: see qcom,gpu-pwrlevels), keeping the boot clock");
++	if (!level) {
++		return false;
++	}
++	int rc = sweet_rpm_gpu_vote(level);
++	if (rc) {
++		printf("SWEET GPUK: the RPM did not raise the GPU rail (%d), keeping the boot clock\n", rc);
++		return false;
++	}
++	uint64_t vco = 2ull * mhz * 1000000ull;
++	*pll_l = (uint32_t)(vco / 19200000ull);
++	*pll_alpha = (uint32_t)(((vco - (uint64_t)*pll_l * 19200000ull) << 16) / 19200000ull);
++	*mhz_out = mhz;
++	printf("SWEET GPUK: GPU rail at level %u; PLL0 L 0x%x alpha 0x%04x (%u MHz), RCG /2 -> %u MHz\n",
++	    level, *pll_l, *pll_alpha, 2 * mhz, mhz);
++	return true;
++}
++
+ static int
+ g_gpu_clock_up(void)
+ {
++	uint32_t pll_l = 0x1b, pll_alpha = 0xb555, fast_mhz = 0;
++	bool fast = g_gpu_fast_clock(&pll_l, &pll_alpha, &fast_mhz);
+ 	vm_offset_t p = g_gpu_map(0x05990000ULL);
+ 	vm_offset_t c = g_gpu_map(0x05991000ULL);
+ 	if (!p || !c) {
+@@ -238,9 +295,9 @@
+ 	volatile uint32_t *r = (volatile uint32_t *)p;
+ 	printf("SWEET GPUK: PLL0 MODE 0x%08x STATUS 0x%08x\n", *mode, r[0x30 / 4]);
+ 	g_dwait(200);
+-	g_pw("PLL0 L_VAL", &r[0x04 / 4], 0x1b);
++	g_pw("PLL0 L_VAL", &r[0x04 / 4], pll_l);
+ 	g_pw("PLL0 CAL_L_VAL", &r[0x08 / 4], 0x44);
+-	g_pw("PLL0 ALPHA", &r[0x40 / 4], 0xb555);
++	g_pw("PLL0 ALPHA", &r[0x40 / 4], pll_alpha);
+ 	g_pw("PLL0 CONFIG_CTL", &r[0x18 / 4], 0x20485699);
+ 	g_pw("PLL0 CONFIG_CTL_U", &r[0x1c / 4], 0x00002261);
+ 	g_pw("PLL0 CONFIG_CTL_U1", &r[0x20 / 4], 0x329a299c);
+@@ -280,7 +337,12 @@
+ 	if (hid_div < 1 || hid_div > 3) {
+ 		hid_div = 3;
+ 	}
+-	printf("SWEET GPUK: GPU clock divider field %u -> ~%u MHz\n", hid_div, 532u * 2u / (hid_div + 1u));
++	if (fast) {
++		hid_div = 3;	/* /2 of PLL0 at twice the frequency */
++		printf("SWEET GPUK: GPU clock divider field 3 -> %u MHz (sweetgpumhz)\n", fast_mhz);
++	} else {
++		printf("SWEET GPUK: GPU clock divider field %u -> ~%u MHz\n", hid_div, 532u * 2u / (hid_div + 1u));
++	}
+ 	g_pw("GX_GFX3D_SRC CFG", &cc[0x20 / 4], (1u << 8) | hid_div);
+ 	g_pw("GX_GFX3D_SRC CMD update", &cc[0x1c / 4], cc[0x1c / 4] | 1u);
+ 	uint32_t cmd = 0;
+@@ -4698,6 +4760,15 @@
+ 	if (!on) {
+ 		return;
+ 	}
++	/*
++	 * 0121: SM6375 has no RPMh: this BCM path was written for sweet's SM7150, and its first read of the apps RSC
++	 * (0x18220000, not in miami's DT) hung (log83). Memory bandwidth here is an RPM request (sweet_rpm.c); until that
++	 * vote is written, sweetddr only says so.
++	 */
++	printf("SWEET GPUB: sweetddr ignored: this SoC has no RPMh (its bus votes go to the RPM, not done yet)\n");
++	if (on) {
++		return;
++	}
+ 	static const char *const bcm[] = { "MC0", "SH0" };
+ 	for (unsigned i = 0; i < sizeof(bcm) / sizeof(bcm[0]); i++) {
+ 		uint32_t off = 0, val = 1u << 30 | 1u << 29 | 0x3fffu << 14 | 0x3fffu;
