@@ -1,0 +1,101 @@
+--- a/bsd/dev/sweet_gpu_a619.c
++++ b/bsd/dev/sweet_gpu_a619.c
+@@ -3552,8 +3552,8 @@
+ static const volatile uint32_t *
+ g_dbg_rd(uint64_t iova)
+ {
+-	static struct { uint64_t page; vm_offset_t va; } c[24];
+-	static unsigned nc;
++	static struct { uint64_t page; vm_offset_t va; } c[48];
++	static unsigned nc, next;
+ 	volatile uint64_t *l1 = (volatile uint64_t *)gp.pt_kva;
+ 	volatile uint64_t *l2 = g_as_peek(l1, (unsigned)((iova >> 30) & 0x1ff));
+ 	volatile uint64_t *l3 = l2 ? g_as_peek(l2, (unsigned)((iova >> 21) & 0x1ff)) : NULL;
+@@ -3566,14 +3566,20 @@
+ 	for (unsigned i = 0; i < nc; i++)
+ 		if (c[i].page == page)
+ 			return (const volatile uint32_t *)(c[i].va + (vm_offset_t)(iova & 0xfffull));
+-	if (nc >= 24)
+-		return NULL;
+ 	vm_offset_t va = ml_io_map((vm_offset_t)page, 0x1000);
+ 	if (!va)
+ 		return NULL;
+-	c[nc].page = page;
+-	c[nc].va = va;
+-	nc++;
++	unsigned k;
++	if (nc < 48) {
++		k = nc++;
++	} else {
++		/* 0116: the cache filled up after ~550 jobs and every later dump decoded nothing; reuse the oldest slot */
++		k = next;
++		next = (next + 1) % 48;
++		ml_io_unmap(c[k].va, 0x1000);
++	}
++	c[k].page = page;
++	c[k].va = va;
+ 	return (const volatile uint32_t *)(va + (vm_offset_t)(iova & 0xfffull));
+ }
+ 
+@@ -3602,10 +3608,19 @@
+ 				}
+ 			}
+ 			if (op == 0x3f && cnt >= 3 && depth < 3) {
+-				const volatile uint32_t *a = g_dbg_rd(iova + 4ull * (i + 1)), *b = g_dbg_rd(iova + 4ull * (i + 2)),
+-				    *z = g_dbg_rd(iova + 4ull * (i + 3));
+-				if (a && b && z)
+-					g_dbg_walk((uint64_t)*a | ((uint64_t)*b << 32), *z & 0xfffff, depth + 1);
++				/* copy each word before the next read: a read can evict the page an earlier pointer points into */
++				const volatile uint32_t *q;
++				uint32_t a, b, z;
++				if ((q = g_dbg_rd(iova + 4ull * (i + 1))) == NULL)
++					return;
++				a = *q;
++				if ((q = g_dbg_rd(iova + 4ull * (i + 2))) == NULL)
++					return;
++				b = *q;
++				if ((q = g_dbg_rd(iova + 4ull * (i + 3))) == NULL)
++					return;
++				z = *q;
++				g_dbg_walk((uint64_t)a | ((uint64_t)b << 32), z & 0xfffff, depth + 1);
+ 			}
+ 			i += 1 + cnt;
+ 		} else if ((h >> 28) == 4u) {
+@@ -3733,7 +3748,11 @@
+ 	 * poll without sleeping for the first 30 ms, then fall back to sleeping.
+ 	 */
+ 	uint64_t spin_end;
+-	clock_interval_to_deadline(30, NSEC_PER_MSEC, &spin_end);
++	/*
++	 * 0116: a 0 ms wait is a status check (vkGetFenceStatus, a poll) and must not block; 1-29 ms waits spin only that
++	 * long. Before, every wait spun the full 30 ms first: 6030 polls in one test cost backboardd 67 s of CPU.
++	 */
++	clock_interval_to_deadline(timeout_ms < 30 ? timeout_ms : 30, NSEC_PER_MSEC, &spin_end);
+ 	do {
+ 		flush_dcache64((addr64_t)gp.fence.pa, 0x1000, TRUE);
+ 		if ((int32_t)(*f - seq) >= 0)
+@@ -3742,9 +3761,11 @@
+ 			g_dg_wait_done(wb, w0, 1);
+ 			return 0;
+ 		}
++		if (timeout_ms == 0)
++			break;
+ 		delay(20);
+ 	} while (mach_absolute_time() < spin_end);
+-	for (unsigned i = 0; i <= timeout_ms; i++) {
++	for (unsigned i = 0; timeout_ms >= 30 && i <= timeout_ms; i++) {
+ 		flush_dcache64((addr64_t)gp.fence.pa, 0x1000, TRUE);
+ 		if ((int32_t)(*f - seq) >= 0)
+ 		{
+--- a/bsd/kern/kern_memorystatus.c
++++ b/bsd/kern/kern_memorystatus.c
+@@ -1565,6 +1565,9 @@
+ 
+ 	KERNEL_DEBUG_CONSTANT((BSDDBG_CODE(DBG_BSD_MEMSTAT, BSD_MEMSTAT_DO_KILL)) | DBG_FUNC_START,
+ 	    victim_pid, cause, vm_page_free_count, footprint, 0);
++	/* 0116 (sweet): every jetsam kill on the console, to tell "the app was killed for memory" from other launch failures */
++	printf("SWEET DIAG: jetsam kills pid %d [%s], cause %u, footprint %llu MB, free RAM %u pages\n", proc_getpid(p),
++	    *p->p_name ? p->p_name : "(unknown)", cause, footprint >> 20, vm_page_free_count);
+ 	DTRACE_MEMORYSTATUS4(memorystatus_do_kill, proc_t, p, os_reason_t, jetsam_reason, uint32_t, cause, uint64_t, footprint);
+ 
+ #if CONFIG_JETSAM

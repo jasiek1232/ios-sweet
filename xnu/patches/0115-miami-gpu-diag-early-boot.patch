@@ -1,0 +1,15 @@
+--- a/bsd/dev/sweet_gpu_a619.c
++++ b/bsd/dev/sweet_gpu_a619.c
+@@ -4119,6 +4119,12 @@
+ 	vm_offset_t v;
+ 	unsigned total = (unsigned)(G_POOL_SIZE / G_POOL_PAGE), used = 0, run = 0, best = 0, wins = 0;
+ 
++	if (!svc.ready || gp.fence.pa == 0 || gp.fence.kva == 0) {
++		/* the display heartbeat starts at boot, the GPU ~20 s later (or is resetting): no fence page, no GPU registers yet */
++		printf("SWEET DIAG gpu[%s]: GPU not ready yet (submission service %s), free RAM %u pages\n", why,
++		    svc.ready ? "up" : "down", vm_page_free_count);
++		return;
++	}
+ 	flush_dcache64((addr64_t)gp.fence.pa, 0x1000, TRUE);
+ 	done = *(volatile uint32_t *)gp.fence.kva;
+ 	if ((v = g_gpu_map(G_CP_BASE + 0x210 * 4)))

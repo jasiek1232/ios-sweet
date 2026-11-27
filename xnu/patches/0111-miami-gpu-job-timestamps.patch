@@ -1,0 +1,109 @@
+--- a/bsd/dev/sweet_gpu_a619.c
++++ b/bsd/dev/sweet_gpu_a619.c
+@@ -3398,6 +3398,11 @@
+ 
+ /* when each fence was submitted (mach time), for latency stats */
+ static uint64_t g_sub_ts[64];
++/* GPU-clock (19.2 MHz) stamps per job: submit (CPU read), start and end (GPU writes into the fence page at 0x100) */
++static uint64_t g_sub_gts[64];
++uint64_t sweet_gpu_timestamp(void);
++#define G_TS_OFF 0x100u
++static uint64_t g_ls_n, g_ls_q, g_ls_x, g_ls_xmax, g_ls_n2, g_ls_late;
+ uint64_t sweet_gpu_fence_submit_time(uint32_t fence);
+ 
+ uint64_t
+@@ -3417,7 +3422,7 @@
+ 	 * Event numbers: CACHE_FLUSH_TS 0x04, PC_CCU_INVALIDATE_DEPTH 0x18, PC_CCU_INVALIDATE_COLOR 0x19.
+ 	 */
+ 	const unsigned head = g_wrap ? 4 : 0;
+-	const unsigned total = head + n + 6;	/* + WAIT_FOR_IDLE (1) + fence write (5 / 4 old) */
++	const unsigned total = head + n + 6 + 9;	/* + WAIT_FOR_IDLE (1) + fence write (5 / 4 old) */
+ 	unsigned tries = 0;
+ 
+ 	if (!svc.ready || n == 0 || total > G_RING_DW / 2)
+@@ -3434,20 +3439,36 @@
+ 		g_settle(1);
+ 	}
+ 	uint32_t w = svc.wptr;
++	const uint32_t seq = ++svc.seq;
++	g_sub_gts[seq & 63] = sweet_gpu_timestamp();
++	const uint64_t tsva = gp.fence.iova + G_TS_OFF + 16ull * (seq & 63);
+ 	if (g_wrap) {
+ 		const uint32_t hd[4] = { G_PKT7(0x46, 1), 0x18, G_PKT7(0x46, 1), 0x19 };
+ 		for (unsigned i = 0; i < 4; i++)
+ 			ring[(w + i) & (G_RING_DW - 1)] = hd[i];
+ 		w += 4;
+ 	}
++	{
++		const uint32_t st[4] = { G_PKT7(0x3e, 3), 0x980 | (2u << 18), (uint32_t)tsva, (uint32_t)(tsva >> 32) };
++		for (unsigned i = 0; i < 4; i++)
++			ring[(w + i) & (G_RING_DW - 1)] = st[i];
++		w += 4;
++	}
+ 	for (unsigned i = 0; i < n; i++)
+ 		ring[(w + i) & (G_RING_DW - 1)] = cmds[i];
+ 	w += n;
+-	const uint32_t seq = ++svc.seq;
+ 	g_sub_ts[seq & 63] = mach_absolute_time();
+ 	uint32_t tail[6];
+ 	unsigned tn;
+ 	tail[0] = G_PKT7(0x26, 0);
++	{
++		/* end stamp once the job is idle, before the fence write */
++		const uint64_t eva = tsva + 8;
++		const uint32_t en[5] = { G_PKT7(0x26, 0), G_PKT7(0x3e, 3), 0x980 | (2u << 18), (uint32_t)eva, (uint32_t)(eva >> 32) };
++		for (unsigned i = 0; i < 5; i++)
++			ring[(w + i) & (G_RING_DW - 1)] = en[i];
++		w += 5;
++	}
+ 	if (g_wrap) {
+ 		tail[1] = G_PKT7(0x46, 4);
+ 		tail[2] = 0x04;		/* CACHE_FLUSH_TS, no IRQ (the kernel has no SPI support) */
+@@ -3475,6 +3496,27 @@
+ 	return 0;
+ }
+ 
++static void
++g_lat_note(uint32_t seq)
++{
++	volatile uint32_t *t = (volatile uint32_t *)((uintptr_t)gp.fence.kva + G_TS_OFF + 16u * (seq & 63));
++	uint64_t st = ((uint64_t)t[1] << 32) | t[0], en = ((uint64_t)t[3] << 32) | t[2];
++	uint64_t now = sweet_gpu_timestamp(), sub = g_sub_gts[seq & 63];
++	if (!st || !en || en < st || st < sub || now < en)
++		return;
++	g_ls_n++;
++	g_ls_q += st - sub;
++	g_ls_x += en - st;
++	if (en - st > g_ls_xmax)
++		g_ls_xmax = en - st;
++	g_ls_late += now - en;
++	if (g_ls_n >= 200) {
++		printf("SWEET GPULAT: %llu jobs: queue before start avg %llu us, GPU execution avg %llu us max %llu us, fence noticed after end avg %llu us\n",
++		    g_ls_n, g_ls_q * 10 / 192 / g_ls_n, g_ls_x * 10 / 192 / g_ls_n, g_ls_xmax * 10 / 192, g_ls_late * 10 / 192 / g_ls_n);
++		g_ls_n = g_ls_q = g_ls_x = g_ls_xmax = g_ls_late = 0;
++	}
++}
++
+ __attribute__((optnone, noinline)) int
+ sweet_gpu_wait(uint32_t seq, unsigned timeout_ms)
+ {
+@@ -3488,13 +3530,19 @@
+ 	do {
+ 		flush_dcache64((addr64_t)gp.fence.pa, 0x1000, TRUE);
+ 		if ((int32_t)(*f - seq) >= 0)
++		{
++			g_lat_note(seq);
+ 			return 0;
++		}
+ 		delay(20);
+ 	} while (mach_absolute_time() < spin_end);
+ 	for (unsigned i = 0; i <= timeout_ms; i++) {
+ 		flush_dcache64((addr64_t)gp.fence.pa, 0x1000, TRUE);
+ 		if ((int32_t)(*f - seq) >= 0)
++		{
++			g_lat_note(seq);
+ 			return 0;
++		}
+ 		g_settle(1);
+ 	}
+ 	return -1;

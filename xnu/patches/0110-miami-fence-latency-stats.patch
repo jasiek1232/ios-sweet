@@ -1,0 +1,75 @@
+--- a/bsd/dev/sweet_gpu_a619.c	2026-11-26 00:01:48.208547618 +0100
++++ b/bsd/dev/sweet_gpu_a619.c	2026-11-26 00:01:48.211214426 +0100
+@@ -3396,6 +3396,16 @@
+ 
+ #define G_RING_DW 0x2000u
+ 
++/* when each fence was submitted (mach time), for latency stats */
++static uint64_t g_sub_ts[64];
++uint64_t sweet_gpu_fence_submit_time(uint32_t fence);
++
++uint64_t
++sweet_gpu_fence_submit_time(uint32_t fence)
++{
++	return g_sub_ts[fence & 63];
++}
++
+ __attribute__((optnone, noinline)) int
+ sweet_gpu_submit(const uint32_t *cmds, unsigned n, uint32_t *seq_out)
+ {
+@@ -3434,6 +3444,7 @@
+ 		ring[(w + i) & (G_RING_DW - 1)] = cmds[i];
+ 	w += n;
+ 	const uint32_t seq = ++svc.seq;
++	g_sub_ts[seq & 63] = mach_absolute_time();
+ 	uint32_t tail[6];
+ 	unsigned tn;
+ 	tail[0] = G_PKT7(0x26, 0);
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp	2026-11-26 00:01:48.210018089 +0100
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp	2026-11-26 00:01:48.212490551 +0100
+@@ -288,12 +288,14 @@
+ 
+ extern "C" uint32_t sweet_gpu_v2_newest_fence(void);
+ extern "C" int sweet_gpu_wait_fence_ns(uint32_t fence, uint64_t timeout_ns);
++extern "C" uint64_t sweet_gpu_fence_submit_time(uint32_t fence);
+ static uint32_t sweet_fb_sync_timeouts;
+ /* sweetfbsync=0 turns the wait and the cache maintenance off */
+ static int sweet_fb_gpu_sync = 1;
+ static uint32_t sweet_fb_sync_ms = 250;		/* sweetfbsyncms=N: how long a present waits for the GPU */
+ static uint64_t sweet_fb_wait_total_ns, sweet_fb_wait_max_ns;
+ static uint32_t sweet_fb_presents;
++static uint64_t sweet_fb_age_total_ns, sweet_fb_lat_total_ns, sweet_fb_behind_total;
+ static volatile uint32_t sweet_fb_swap_fence;	/* newest GPU fence when the last swap arrived */
+ static uint64_t sweet_fb_copy_total_ns;
+ 
+@@ -429,7 +431,18 @@
+ 					}
+ 				}
+ 				uint64_t waited_ns = 0;
+-				absolutetime_to_nanoseconds(mach_absolute_time() - t0, &waited_ns);
++				uint64_t t1 = mach_absolute_time();
++				absolutetime_to_nanoseconds(t1 - t0, &waited_ns);
++				if (nf != 0) {
++					uint64_t ts = sweet_gpu_fence_submit_time(nf), age = 0, lat = 0;
++					if (ts != 0 && ts < t0) {
++						absolutetime_to_nanoseconds(t0 - ts, &age);
++						absolutetime_to_nanoseconds(t1 - ts, &lat);
++						sweet_fb_age_total_ns += age;
++						sweet_fb_lat_total_ns += lat;
++					}
++					sweet_fb_behind_total += sweet_gpu_v2_newest_fence() - nf;
++				}
+ 				sweet_fb_wait_total_ns += waited_ns;
+ 				if (waited_ns > sweet_fb_wait_max_ns) {
+ 					sweet_fb_wait_max_ns = waited_ns;
+@@ -437,7 +450,10 @@
+ 				if (++sweet_fb_presents % 100 == 0) {
+ 					IOLog("SWEET FB: 100 presents: GPU wait avg %llu us, max %llu us, copy avg %llu us, %u timeouts so far\n",
+ 					    sweet_fb_wait_total_ns / 100000, sweet_fb_wait_max_ns / 1000, sweet_fb_copy_total_ns / 100000, sweet_fb_sync_timeouts);
++					IOLog("SWEET FB: fence age when the wait began avg %llu us, submit to done avg %llu us, newer submits already queued avg %llu.%02llu\n",
++					    sweet_fb_age_total_ns / 100000, sweet_fb_lat_total_ns / 100000, sweet_fb_behind_total / 100, sweet_fb_behind_total % 100);
+ 					sweet_fb_wait_total_ns = sweet_fb_wait_max_ns = sweet_fb_copy_total_ns = 0;
++					sweet_fb_age_total_ns = sweet_fb_lat_total_ns = sweet_fb_behind_total = 0;
+ 				}
+ 				for (int32_t y = 0; y < h; y++) {
+ 					uintptr_t row = src + s->offset + (uint64_t)(sy + y) * s->bytesPerRow + (uint64_t)sx * 4;

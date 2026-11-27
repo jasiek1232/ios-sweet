@@ -1,0 +1,126 @@
+--- a/bsd/dev/sweet_gpu_a619.c
++++ b/bsd/dev/sweet_gpu_a619.c
+@@ -3406,6 +3406,10 @@
+ static char g_sub_nm[64][17];
+ static uint32_t g_sub_n[64], g_slow_logged;
+ void proc_selfname(char *buf, int size);
++static uint64_t g_sub_ib_iova[64][4];
++static uint32_t g_sub_ib_dw[64][4];
++static uint8_t g_sub_ib_cnt[64];
++static uint32_t g_dump_logged;
+ uint64_t sweet_gpu_fence_submit_time(uint32_t fence);
+ 
+ uint64_t
+@@ -3502,6 +3506,90 @@
+ 	return 0;
+ }
+ 
++/* ---- diagnostics: decode what a slow job's indirect buffers hold (read-only, small io-mapped page cache) ---- */
++static volatile uint64_t *g_as_peek(volatile uint64_t *tbl, unsigned idx);
++
++static const volatile uint32_t *
++g_dbg_rd(uint64_t iova)
++{
++	static struct { uint64_t page; vm_offset_t va; } c[24];
++	static unsigned nc;
++	volatile uint64_t *l1 = (volatile uint64_t *)gp.pt_kva;
++	volatile uint64_t *l2 = g_as_peek(l1, (unsigned)((iova >> 30) & 0x1ff));
++	volatile uint64_t *l3 = l2 ? g_as_peek(l2, (unsigned)((iova >> 21) & 0x1ff)) : NULL;
++	if (!l3)
++		return NULL;
++	uint64_t pte = l3[(iova >> 12) & 0x1ff];
++	if (!(pte & 1ull))
++		return NULL;
++	uint64_t page = pte & 0x0000fffffffff000ull;
++	for (unsigned i = 0; i < nc; i++)
++		if (c[i].page == page)
++			return (const volatile uint32_t *)(c[i].va + (vm_offset_t)(iova & 0xfffull));
++	if (nc >= 24)
++		return NULL;
++	vm_offset_t va = ml_io_map((vm_offset_t)page, 0x1000);
++	if (!va)
++		return NULL;
++	c[nc].page = page;
++	c[nc].va = va;
++	nc++;
++	return (const volatile uint32_t *)(va + (vm_offset_t)(iova & 0xfffull));
++}
++
++static uint32_t g_dh7[128], g_dh4, g_dtot;
++
++static void
++g_dbg_walk(uint64_t iova, uint32_t ndw, unsigned depth)
++{
++	uint32_t i = 0;
++	while (i < ndw) {
++		const volatile uint32_t *p = g_dbg_rd(iova + 4ull * i);
++		if (!p)
++			return;
++		uint32_t h = *p;
++		g_dtot++;
++		if ((h >> 28) == 7u) {
++			uint32_t cnt = h & 0x7fff, op = (h >> 16) & 0x7f;
++			g_dh7[op]++;
++			if (op == 0x3f && cnt >= 3 && depth < 3) {
++				const volatile uint32_t *a = g_dbg_rd(iova + 4ull * (i + 1)), *b = g_dbg_rd(iova + 4ull * (i + 2)),
++				    *z = g_dbg_rd(iova + 4ull * (i + 3));
++				if (a && b && z)
++					g_dbg_walk((uint64_t)*a | ((uint64_t)*b << 32), *z & 0xfffff, depth + 1);
++			}
++			i += 1 + cnt;
++		} else if ((h >> 28) == 4u) {
++			g_dh4++;
++			i += 1 + (h & 0x7f);
++		} else {
++			i++;
++		}
++	}
++}
++
++static void
++g_dbg_dump(uint32_t seq)
++{
++	static volatile int busy;
++	if (busy || g_dump_logged >= 14)
++		return;
++	busy = 1;
++	g_dump_logged++;
++	for (unsigned i = 0; i < 128; i++)
++		g_dh7[i] = 0;
++	g_dh4 = g_dtot = 0;
++	for (unsigned k = 0; k < g_sub_ib_cnt[seq & 63] && k < 4; k++)
++		g_dbg_walk(g_sub_ib_iova[seq & 63][k], g_sub_ib_dw[seq & 63][k], 0);
++	printf("SWEET GPUIB: seq %u: %u IBs, %u packet headers, %u register-write packets; type7 ops (hex:count):", seq,
++	    g_sub_ib_cnt[seq & 63], g_dtot, g_dh4);
++	for (unsigned i = 0; i < 128; i++)
++		if (g_dh7[i])
++			printf(" %x:%u", i, g_dh7[i]);
++	printf("\n");
++	busy = 0;
++}
++
+ static void
+ g_lat_note(uint32_t seq)
+ {
+@@ -3514,6 +3602,7 @@
+ 		g_slow_logged++;
+ 		printf("SWEET GPUSLOW: seq %u from '%s': %u cmd dwords, queue %llu us, execution %llu us\n", seq,
+ 		    g_sub_nm[seq & 63], g_sub_n[seq & 63], (st - sub) * 10 / 192, (en - st) * 10 / 192);
++		g_dbg_dump(seq);
+ 	}
+ 	g_ls_n++;
+ 	g_ls_q += st - sub;
+@@ -3794,6 +3883,13 @@
+ 		cmds[i * 4 + 3] = dwords[i];
+ 	}
+ 	int rc = sweet_gpu_submit(cmds, n * 4, &seq);
++	if (rc == 0) {
++		g_sub_ib_cnt[seq & 63] = (uint8_t)(n < 4 ? n : 4);
++		for (unsigned i = 0; i < n && i < 4; i++) {
++			g_sub_ib_iova[seq & 63][i] = iova[i];
++			g_sub_ib_dw[seq & 63][i] = dwords[i] & 0xfffff;
++		}
++	}
+ 	if (rc == -2)
+ 		*busy = true;
+ 	return rc == 0 ? seq : 0;

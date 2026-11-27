@@ -1,0 +1,35 @@
+--- a/bsd/dev/sweet_gpu_a619.c
++++ b/bsd/dev/sweet_gpu_a619.c
+@@ -232,6 +232,7 @@
+  * work out (unknown bin, frequency not in its table, the RPM not answering) leaves the boot-time clock.
+  */
+ int sweet_rpm_gpu_vote(unsigned level);
++int sweet_rpm_write(uint32_t set, uint32_t type, uint32_t id, uint32_t key, uint32_t value);
+ 
+ struct g_opp { uint32_t mhz, level; };
+ static const struct g_opp g_opp_900[] = { { 900, 416 }, { 840, 384 }, { 770, 320 }, { 650, 256 }, { 0, 0 } };
+@@ -4761,12 +4762,19 @@
+ 		return;
+ 	}
+ 	/*
+-	 * 0121: SM6375 has no RPMh: this BCM path was written for sweet's SM7150, and its first read of the apps RSC
+-	 * (0x18220000, not in miami's DT) hung (log83). Memory bandwidth here is an RPM request (sweet_rpm.c); until that
+-	 * vote is written, sweetddr only says so.
++	 * 0122: SM6375 has no RPMh (the BCM path below was written for sweet's SM7150; its first read of the apps RSC hung,
++	 * log83). Here DDR's clock is an RPM clock: mainline icc-rpm sets "bimc" as QCOM_SMD_RPM_MEM_CLK ("clk2") id 0, key
++	 * "KHz". sweetddr=1 asks for the top of miami's ddr-bw-opp-table (opp-2092: 2092 MHz), sweetddr=N (N > 1000) for N kHz.
++	 * Nothing else votes DDR on this port: the boot's own level stays otherwise.
+ 	 */
+-	printf("SWEET GPUB: sweetddr ignored: this SoC has no RPMh (its bus votes go to the RPM, not done yet)\n");
+-	if (on) {
++	{
++		uint32_t khz = on == 1 ? 2092000u : on;
++		if (khz < 100000u) {
++			printf("SWEET GPUB: sweetddr=%u: give 1 (top) or a DDR clock in kHz\n", on);
++			return;
++		}
++		int rc = sweet_rpm_write(0, 0x326b6c63u /* clk2 */, 0, 0x007a484bu /* KHz */, khz);
++		printf("SWEET GPUB: DDR (RPM clk2 0) %u kHz -> %s (%d)\n", khz, rc ? "FAILED" : "ok", rc);
+ 		return;
+ 	}
+ 	static const char *const bcm[] = { "MC0", "SH0" };

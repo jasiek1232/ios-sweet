@@ -1,0 +1,41 @@
+--- a/bsd/dev/sweet_gpu_a619.c
++++ b/bsd/dev/sweet_gpu_a619.c
+@@ -32,6 +32,15 @@
+ #include <kern/locks.h>
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++/*
++ * 0117: ml_io_map() mappings are permanent and can never be unmapped; the IB decoder's page cache evicts, so it maps
++ * with ml_io_map_unmappable() (freeable) and frees with ml_io_unmap(). Neither is in the bsd view of machine_routines.h.
++ */
++extern vm_offset_t ml_io_map_unmappable(vm_offset_t, vm_size_t, unsigned int);
++extern void ml_io_unmap(vm_offset_t, vm_size_t);
++#ifndef VM_WIMG_IO
++#define VM_WIMG_IO 0x7u	/* osfmk/arm/memory_types.h: coherent, not cacheable, guarded (what ml_io_map uses) */
++#endif
+ extern kern_return_t thread_terminate(thread_t);
+ extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
+ void sweet_gpu_a619_start(void);
+@@ -3566,7 +3575,7 @@
+ 	for (unsigned i = 0; i < nc; i++)
+ 		if (c[i].page == page)
+ 			return (const volatile uint32_t *)(c[i].va + (vm_offset_t)(iova & 0xfffull));
+-	vm_offset_t va = ml_io_map((vm_offset_t)page, 0x1000);
++	vm_offset_t va = ml_io_map_unmappable((vm_offset_t)page, 0x1000, VM_WIMG_IO);
+ 	if (!va)
+ 		return NULL;
+ 	unsigned k;
+@@ -3636,9 +3645,11 @@
+ g_dbg_dump(uint32_t seq)
+ {
+ 	static volatile int busy;
+-	if (busy || g_dump_logged >= 40 || g_dg_dump_seq[seq & 63] == seq)
++	if (g_dump_logged >= 40 || g_dg_dump_seq[seq & 63] == seq)
++		return;
++	/* 0117: two waiters can finish at once; only one may use the decoder's page cache, which now unmaps pages */
++	if (!__sync_bool_compare_and_swap(&busy, 0, 1))
+ 		return;
+-	busy = 1;
+ 	g_dg_dump_seq[seq & 63] = seq;
+ 	g_dump_logged++;
+ 	for (unsigned i = 0; i < 64; i++)

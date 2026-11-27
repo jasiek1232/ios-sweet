@@ -1,0 +1,95 @@
+diff --git a/iokit/Kernel/arm/SweetAccelerator.cpp b/iokit/Kernel/arm/SweetAccelerator.cpp
+new file mode 100644
+index 0000000..4b5ab67
+--- /dev/null
++++ b/iokit/Kernel/arm/SweetAccelerator.cpp
+@@ -0,0 +1,61 @@
++/*
++ * The GPU as Metal sees it. Metal.framework (MTLRegisterDevices) iterates IOServiceMatching("IOAcceleratorES"),
++ * loads /System/Library/Extensions/<MetalPluginName>.bundle, takes the class named MetalPluginClassName (a
++ * subclass of Metal's _MTLDevice) and calls -initWithAcceleratorPort: with the service. SweetAccelerator
++ * publishes itself under that class name with the properties that point Metal at SweetMetal2.bundle
++ * (metal2vulkan + Mesa Turnip), which opens a user client of this service. The user client is the same
++ * SweetGPUUserClient as SweetGPUService's (bsd/dev/sweet_gpu_a619.c holds the one GPU), so this is only the
++ * alias that makes the GPU visible to Metal.
++ *
++ * Boot-arg sweetmtl=2 publishes it (and needs sweetgpu=1 or more for the GPU itself). Without sweetmtl Metal
++ * finds no device and Core Animation keeps its software renderer, as before.
++ *
++ * Structure follows ios-flame's SweetAccelerator (MIT, same author line as ios-sweet).
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <IOKit/IOService.h>
++#include <IOKit/IOLib.h>
++#include <IOKit/IOKitKeys.h>
++#include <pexpert/pexpert.h>
++
++class IOAcceleratorES : public IOService {
++	OSDeclareDefaultStructors(IOAcceleratorES);
++};
++
++OSDefineMetaClassAndStructors(IOAcceleratorES, IOService);
++
++class SweetAccelerator : public IOAcceleratorES {
++	OSDeclareDefaultStructors(SweetAccelerator);
++
++public:
++	IOService *probe(IOService *provider, SInt32 *score) APPLE_KEXT_OVERRIDE;
++	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++};
++
++OSDefineMetaClassAndStructors(SweetAccelerator, IOAcceleratorES);
++
++IOService *
++SweetAccelerator::probe(IOService *provider, SInt32 *score)
++{
++	uint32_t mtl = 0, gpu = 0;
++	PE_parse_boot_argn("sweetmtl", &mtl, sizeof(mtl));
++	PE_parse_boot_argn("sweetgpu", &gpu, sizeof(gpu));
++	return (mtl == 2 && gpu != 0) ? IOService::probe(provider, score) : NULL;
++}
++
++bool
++SweetAccelerator::start(IOService *provider)
++{
++	if (!IOService::start(provider)) {
++		return false;
++	}
++	setProperty("MetalPluginName", "SweetMetal2");
++	setProperty("MetalPluginClassName", "SweetMTL2Device");
++	setProperty("IOGLBundleName", "SweetMetal2");
++	setProperty("model", "Adreno 619");
++	setProperty(kIOUserClientClassKey, "SweetGPUUserClient");
++	registerService();
++	IOLog("SWEET MTL: IOAcceleratorES published (MetalPluginName SweetMetal2)\n");
++	return true;
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/iokit/KernelConfigTables.cpp b/iokit/KernelConfigTables.cpp
+index 2e79d3c..1c34a61 100644
+--- a/iokit/KernelConfigTables.cpp
++++ b/iokit/KernelConfigTables.cpp
+@@ -87,6 +87,11 @@ const char * gIOKernelConfigTables =
+     "     'IOProviderClass' = IOResources;"
+     "     'IOMatchCategory' = SweetGPUService;"
+     "   },"
++    "   {"
++    "     'IOClass'         = SweetAccelerator;"
++    "     'IOProviderClass' = IOResources;"
++    "     'IOMatchCategory' = SweetAccelerator;"
++    "   },"
+ #endif
+     "   {"
+     "     'IOClass'         = IOPanicPlatform;"
+diff --git a/iokit/conf/files.arm64 b/iokit/conf/files.arm64
+index 3fd1516..d34ed82 100644
+--- a/iokit/conf/files.arm64
++++ b/iokit/conf/files.arm64
+@@ -17,6 +17,7 @@ iokit/Kernel/arm/SweetSurface.cpp                                optional iokitc
+ iokit/Kernel/arm/SweetFramebuffer.cpp                            optional iokitcpp
+ iokit/Kernel/arm/SweetBattery.cpp                                optional iokitcpp
+ iokit/Kernel/arm/SweetGPUService.cpp                             optional iokitcpp
++iokit/Kernel/arm/SweetAccelerator.cpp                            optional iokitcpp
+ iokit/Kernel/arm/hid/SweetHID.cpp                                optional iokitcpp
+ iokit/Kernel/arm/hid/IOHIDEvent.cpp                              optional iokitcpp
+ iokit/Kernel/arm/hid/IOHIDEventServiceQueue.cpp                  optional iokitcpp
