@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Symbolicate watchdog / hang reports (.ips with bug_type 509: "failed to terminate gracefully",
-0x8badf00d) from /private/var/mobile/Library/Logs/CrashReporter.
+0x8badf00d) and ordinary crash reports (bug_type 309) from /private/var/mobile/Library/Logs/CrashReporter.
 
   tools/sweet-hang.py CACHE REPORT.ips [REPORT.ips ...] [--all] [--proc NAME]
 
@@ -53,10 +53,48 @@ def frames(cache, images, th):
     return out
 
 
+def crash(cache, path, H, B):
+    """bug_type 309: an ordinary crash report (EXC_*, abort, ObjC exception)."""
+    imgs = B.get('usedImages', [])
+    sc = B.get('sharedCache', {})
+    slide = sc.get('base', 0x180000000) - 0x180000000 if sc else 0
+    print(f'##### {os.path.basename(path)}')
+    print(f'{B.get("procName")}[{B.get("pid")}] at {B.get("captureTime")}')
+    for k in ('exception', 'termination', 'asi', 'ktriageinfo'):
+        if k in B:
+            print(f'  {k}: {json.dumps(B[k])[:1500]}')
+
+    def sym(fr):
+        im = imgs[fr['imageIndex']] if fr.get('imageIndex') is not None and fr['imageIndex'] < len(imgs) else {}
+        off = fr.get('imageOffset', 0)
+        name = im.get('name') or os.path.basename(im.get('path', '')) or '?'
+        if fr.get('symbol'):
+            return f'{name}: {fr["symbol"]} + {fr.get("symbolLocation", 0)}'
+        if im.get('source') == 'S' or (sc and im.get('base', 0) - slide >= 0x180000000 and im.get('base', 0) - slide < 0x300000000):
+            return a2s(cache, im['base'] - slide + off)
+        return f'{name} +{hex(0x100000000 + off)}' if im.get('source') == 'P' or fr['imageIndex'] == 0 else f'{name} +{hex(off)}'
+
+    if 'lastExceptionBacktrace' in B:
+        print('\n  last exception backtrace (where the exception was thrown):')
+        for i, fr in enumerate(B['lastExceptionBacktrace']):
+            print(f'    {i:2d} {sym(fr)}')
+    ft = B.get('faultingThread', 0)
+    for n, th in enumerate(B.get('threads', [])):
+        if n != ft and not th.get('triggered'):
+            continue
+        print(f'\n  crashed thread {n} {th.get("queue", "")} {th.get("name", "")}')
+        for i, fr in enumerate(th.get('frames', [])):
+            print(f'    {i:2d} {sym(fr)}')
+    print()
+
+
 def report(cache, path, show_all, procname):
     text = open(path, errors='replace').read()
     head, body = text.split('\n', 1)
     B = json.loads(body)
+    H = json.loads(head)
+    if 'stackshot' not in B:
+        return crash(cache, path, H, B)
     snap = B['stackshot']
     pp = snap['processByPid']
     images = snap['binaryImages']
