@@ -74,7 +74,10 @@ jobs:
           curl -fsSL -o dash.tgz "http://gondor.apana.org.au/~herbert/dash/files/dash-$DASH_VERSION.tar.gz"
           tar xzf dash.tgz
           cd "dash-$DASH_VERSION"
-          ./configure --host=aarch64-apple-darwin --build=x86_64-apple-darwin CC="$IOS_CC" CC_FOR_BUILD=cc CFLAGS="-Os"
+          # strchrnul() is in the iOS 18.4+ SDK but not in iOS 16's libSystem: configure would find it, the binary
+          # would weak-link it, and dash would jump to address 0 on the phone. dash has its own fallback.
+          ./configure --host=aarch64-apple-darwin --build=x86_64-apple-darwin CC="$IOS_CC" CC_FOR_BUILD=cc CFLAGS="-Os" \
+            ac_cv_func_strchrnul=no
           make -j"$(sysctl -n hw.ncpu)"
           file src/dash
           cp src/dash ../out/bin/dash
@@ -121,6 +124,14 @@ jobs:
       - name: Sign and package
         run: |
           cd out
+          # Weak imports are functions newer than iOS 16 (the SDK is newer than the phone): they resolve to NULL
+          # there and the program crashes at pc 0. Refuse to package anything that has one.
+          bad=0
+          for f in dropbearmulti bin/*; do
+            w=$(nm -m "$f" | grep "weak external" | grep -v "____chkstk_darwin" || true)
+            if [ -n "$w" ]; then echo "::error::$f weak-imports (missing on iOS 16): $w"; bad=1; fi
+          done
+          [ $bad = 0 ]
           for f in dropbearmulti bin/*; do codesign -f -s - "$f"; done
           ls -la . bin
           tar -czf ../ssh-userland.tar.gz .
