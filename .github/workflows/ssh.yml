@@ -99,9 +99,15 @@ jobs:
           fi
           export PATH="$PWD/hostbin:$PATH" SED="$PWD/hostbin/sed"
           echo 's/x/GNU sed ok/' > t.sed && echo x | sed -f t.sed && sed --version 2>&1 | head -1 || true
+          # The iOS SDK leaves out some macOS headers toybox's Darwin code uses (sys/disk.h, ...). The kernel
+          # interfaces behind them are the same XNU, so let missing headers fall back to the macOS SDK's copy
+          # (-idirafter: only used when the iOS SDK has no header of that name).
+          MACSDK=$(xcrun --sdk macosx --show-sdk-path)
+          printf '#!/bin/sh\nexec "%s" -idirafter "%s/usr/include" "$@"\n' "$IOS_CC" "$MACSDK" > "$RUNNER_TEMP/ios-cc-tb"
+          chmod +x "$RUNNER_TEMP/ios-cc-tb"
           cd toybox
           make macos_defconfig
-          make -j"$(sysctl -n hw.ncpu)" HOSTCC=cc CC="$IOS_CC" toybox
+          make -j"$(sysctl -n hw.ncpu)" HOSTCC=cc CC="$RUNNER_TEMP/ios-cc-tb" toybox
           file toybox
           cp toybox ../out/bin/toybox
           # the command list, from a copy of toybox's instlist built for this Mac (not the phone)
