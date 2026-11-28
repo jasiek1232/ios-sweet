@@ -1,0 +1,144 @@
+--- a/iokit/Kernel/arm/SweetPlatformExpert.cpp
++++ b/iokit/Kernel/arm/SweetPlatformExpert.cpp
+@@ -9,6 +9,8 @@
+ #include <IOKit/IOPlatformExpert.h>
+ #include <IOKit/IODeviceTreeSupport.h>
+ #include <IOKit/IOLib.h>
++#include <IOKit/system.h>
++#include <pexpert/pexpert.h>
+ 
+ class SweetPlatformExpert : public IODTPlatformExpert {
+ 	OSDeclareDefaultStructors(SweetPlatformExpert);
+@@ -18,8 +20,97 @@
+ 	void processTopLevel(IORegistryEntry *root) APPLE_KEXT_OVERRIDE;
+ 	const char *deleteList(void) APPLE_KEXT_OVERRIDE;
+ 	const char *excludeList(void) APPLE_KEXT_OVERRIDE;
++	long getGMTTimeOfDay(void) APPLE_KEXT_OVERRIDE;
++	void setGMTTimeOfDay(long secs) APPLE_KEXT_OVERRIDE;
+ };
+ 
++/*
++ * 0124: the time of day from the PMIC's real-time clock. miami's DT: qcom,pmk8350-rtc at rtc@6100 (alarm @6200) on SPMI
++ * slave 0; as mainline rtc-pm8xxx's pmk8350 registers: RTC_CTRL 0x6146 (bit 7 = running), the count at 0x6148..0x614b
++ * (seconds, least significant byte first; read again if the low byte changed meanwhile). XNU waits up to 30 s at boot
++ * for an "IORTC" resource before reading the time (IOKitInitializeTime): publishing it once the RTC answers ends that
++ * wait. Phones like this one usually cannot write the RTC from Android's side (Android keeps an offset in its data
++ * partition instead), so the count need not be today's date: boot-arg sweetutcoff=N adds N seconds, and when iOS sets
++ * the time (Settings or timed) the log says which sweetutcoff keeps it.
++ */
++extern "C" int sweet_spmi_init(void);
++extern "C" int sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out);
++static long long sweet_rtc_off;
++static bool sweet_rtc_off_parsed;
++
++static bool
++sweet_rtc_count(uint32_t *out)
++{
++	if (sweet_spmi_init() != 0) {
++		return false;
++	}
++	for (int tries = 0; tries < 3; tries++) {
++		uint8_t b[4], again;
++		for (unsigned i = 0; i < 4; i++) {
++			if (sweet_spmi_read(0, 0x6148 + i, &b[i]) != 0) {
++				return false;
++			}
++		}
++		if (sweet_spmi_read(0, 0x6148, &again) != 0) {
++			return false;
++		}
++		if (again == b[0]) {
++			*out = (uint32_t)b[0] | (uint32_t)b[1] << 8 | (uint32_t)b[2] << 16 | (uint32_t)b[3] << 24;
++			return true;
++		}
++	}
++	return false;
++}
++
++/* seconds since 1970 -> "YYYY-MM-DD hh:mm:ss" UTC (days-to-civil, H. Hinnant) */
++static void
++sweet_utc_string(long long t, char *buf, size_t len)
++{
++	long long days = t >= 0 ? t / 86400 : (t - 86399) / 86400, sod = t - days * 86400;
++	long long z = days + 719468, era = (z >= 0 ? z : z - 146096) / 146097;
++	long long doe = z - era * 146097, yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
++	long long y = yoe + era * 400, doy = doe - (365 * yoe + yoe / 4 - yoe / 100), mp = (5 * doy + 2) / 153;
++	long long d = doy - (153 * mp + 2) / 5 + 1, m = mp < 10 ? mp + 3 : mp - 9;
++	snprintf(buf, len, "%04lld-%02lld-%02lld %02lld:%02lld:%02lld", y + (m <= 2), m, d, sod / 3600, sod / 60 % 60, sod % 60);
++}
++
++long
++SweetPlatformExpert::getGMTTimeOfDay(void)
++{
++	if (!sweet_rtc_off_parsed) {
++		sweet_rtc_off_parsed = true;
++		long long off = 0;
++		if (PE_parse_boot_argn("sweetutcoff", &off, sizeof(off))) {
++			sweet_rtc_off = off;
++		}
++	}
++	uint32_t count = 0;
++	if (!sweet_rtc_count(&count)) {
++		IOLog("SWEET RTC: no count (SPMI read failed), time of day 0\n");
++		return 0;
++	}
++	long long t = (long long)count + sweet_rtc_off;
++	char raw[24], now[24];
++	sweet_utc_string(count, raw, sizeof(raw));
++	sweet_utc_string(t, now, sizeof(now));
++	IOLog("SWEET RTC: count %u (%s), sweetutcoff %lld -> %s UTC\n", count, raw, sweet_rtc_off, now);
++	return (long)t;
++}
++
++void
++SweetPlatformExpert::setGMTTimeOfDay(long secs)
++{
++	uint32_t count = 0;
++	char now[24];
++	sweet_utc_string(secs, now, sizeof(now));
++	if (!sweet_rtc_count(&count)) {
++		IOLog("SWEET RTC: time set to %s UTC (RTC not readable, not kept)\n", now);
++		return;
++	}
++	sweet_rtc_off = (long long)secs - count;
++	IOLog("SWEET RTC: time set to %s UTC; add sweetutcoff=%lld to the boot args to keep it across boots\n", now, sweet_rtc_off);
++}
++
+ OSDefineMetaClassAndStructors(SweetPlatformExpert, IODTPlatformExpert);
+ 
+ bool
+@@ -31,6 +122,18 @@
+ 	}
+ 	registerService();
+ 	IOLog("SWEET: platform expert registered\n");
++	{
++		uint32_t count = 0;
++		uint8_t ctrl = 0;
++		if (sweet_rtc_count(&count)) {
++			bool running = sweet_spmi_read(0, 0x6146, &ctrl) == 0 && (ctrl & 0x80);
++			IOLog("SWEET RTC: PMIC RTC answers (count %u, control 0x%02x%s); publishing IORTC\n", count, ctrl,
++			    running ? ", running" : ", NOT running");
++			publishResource("IORTC", this);
++		} else {
++			IOLog("SWEET RTC: PMIC RTC not readable, XNU waits 30 s for IORTC and starts in 1970\n");
++		}
++	}
+ 	return true;
+ }
+ 
+--- a/bsd/dev/sweet_spmi.c
++++ b/bsd/dev/sweet_spmi.c
+@@ -86,11 +86,11 @@
+ int
+ sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out)
+ {
+-	/* Restrict access to the battery blocks; keys retain their own lanes. */
++	/* Restrict access to the battery blocks and the RTC; keys retain their own lanes. */
+ 	unsigned peripheral = addr >> 8;
+ 	if (!sp_ready || !out || sid != 0 || addr > 0xffffu ||
+ 	    (peripheral != 0x10 && peripheral != 0x11 && peripheral != 0x12 &&
+-	    peripheral != 0x13 && peripheral != 0x48)) {
++	    peripheral != 0x13 && peripheral != 0x48 && peripheral != 0x61)) {	/* 0x61: RTC (0124) */
+ 		return -1;
+ 	}
+ 	IOLockLock(sp_lock);

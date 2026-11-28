@@ -1,0 +1,92 @@
+--- a/bsd/dev/sweet_spmi.c
++++ b/bsd/dev/sweet_spmi.c
+@@ -14,9 +14,14 @@
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ 
+-#define SP_CORE_PA 0x0c440000u
+-#define SP_OBS_PA  0x0e600000u
+-#define SP_CFG_PA  0x0c40a000u
++/*
++ * 0125: miami's PMIC arbiter (DT qcom,spmi@1c40000; the same three blocks sweet_keys.c uses). These were sweet's
++ * (SM7150: 0x0c440000/0x0e600000/0x0c40a000), which on SM6375 hang the first read (0124's boot stopped right
++ * after "platform expert registered").
++ */
++#define SP_CORE_PA 0x01c40000u
++#define SP_OBS_PA  0x03e00000u
++#define SP_CFG_PA  0x01c0a000u
+ #define SP_NO_APID 0xffffu
+ 
+ static vm_offset_t sp_core, sp_obs, sp_cfg;
+@@ -88,9 +93,10 @@
+ {
+ 	/* Restrict access to the battery blocks and the RTC; keys retain their own lanes. */
+ 	unsigned peripheral = addr >> 8;
+-	if (!sp_ready || !out || sid != 0 || addr > 0xffffu ||
+-	    (peripheral != 0x10 && peripheral != 0x11 && peripheral != 0x12 &&
+-	    peripheral != 0x13 && peripheral != 0x48 && peripheral != 0x61)) {	/* 0x61: RTC (0124) */
++	bool battery = sid == 0 && (peripheral == 0x10 || peripheral == 0x11 || peripheral == 0x12 ||
++	    peripheral == 0x13 || peripheral == 0x48);
++	bool rtc = sid == 6 && peripheral == 0x61;	/* 0125: PMK8350 (slave 6) RTC */
++	if (!sp_ready || !out || addr > 0xffffu || (!battery && !rtc)) {
+ 		return -1;
+ 	}
+ 	IOLockLock(sp_lock);
+--- a/iokit/Kernel/arm/SweetPlatformExpert.cpp
++++ b/iokit/Kernel/arm/SweetPlatformExpert.cpp
+@@ -26,7 +26,7 @@
+ 
+ /*
+  * 0124: the time of day from the PMIC's real-time clock. miami's DT: qcom,pmk8350-rtc at rtc@6100 (alarm @6200) on SPMI
+- * slave 0; as mainline rtc-pm8xxx's pmk8350 registers: RTC_CTRL 0x6146 (bit 7 = running), the count at 0x6148..0x614b
++ * slave 6 (the pmk8350 node's reg; 0125 fixed slave 0, which is a PM6125); as mainline rtc-pm8xxx's pmk8350 registers: RTC_CTRL 0x6146 (bit 7 = running), the count at 0x6148..0x614b
+  * (seconds, least significant byte first; read again if the low byte changed meanwhile). XNU waits up to 30 s at boot
+  * for an "IORTC" resource before reading the time (IOKitInitializeTime): publishing it once the RTC answers ends that
+  * wait. Phones like this one usually cannot write the RTC from Android's side (Android keeps an offset in its data
+@@ -36,22 +36,22 @@
+ extern "C" int sweet_spmi_init(void);
+ extern "C" int sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out);
+ static long long sweet_rtc_off;
+-static bool sweet_rtc_off_parsed;
++static bool sweet_rtc_off_parsed, sweet_rtc_disabled;
+ 
+ static bool
+ sweet_rtc_count(uint32_t *out)
+ {
+-	if (sweet_spmi_init() != 0) {
++	if (sweet_rtc_disabled || sweet_spmi_init() != 0) {
+ 		return false;
+ 	}
+ 	for (int tries = 0; tries < 3; tries++) {
+ 		uint8_t b[4], again;
+ 		for (unsigned i = 0; i < 4; i++) {
+-			if (sweet_spmi_read(0, 0x6148 + i, &b[i]) != 0) {
++			if (sweet_spmi_read(6, 0x6148 + i, &b[i]) != 0) {
+ 				return false;
+ 			}
+ 		}
+-		if (sweet_spmi_read(0, 0x6148, &again) != 0) {
++		if (sweet_spmi_read(6, 0x6148, &again) != 0) {
+ 			return false;
+ 		}
+ 		if (again == b[0]) {
+@@ -122,11 +122,17 @@
+ 	}
+ 	registerService();
+ 	IOLog("SWEET: platform expert registered\n");
+-	{
++	uint32_t rtc_on = 1;
++	PE_parse_boot_argn("sweetrtc", &rtc_on, sizeof(rtc_on));
++	if (!rtc_on) {
++		sweet_rtc_disabled = true;
++		IOLog("SWEET RTC: sweetrtc=0, not read (XNU waits 30 s for IORTC and starts in 1970)\n");
++	} else {
+ 		uint32_t count = 0;
+ 		uint8_t ctrl = 0;
++		IOLog("SWEET RTC: reading the PMK8350 RTC (SPMI arbiter 0x1c40000, slave 6, 0x6148) ...\n");
+ 		if (sweet_rtc_count(&count)) {
+-			bool running = sweet_spmi_read(0, 0x6146, &ctrl) == 0 && (ctrl & 0x80);
++			bool running = sweet_spmi_read(6, 0x6146, &ctrl) == 0 && (ctrl & 0x80);
+ 			IOLog("SWEET RTC: PMIC RTC answers (count %u, control 0x%02x%s); publishing IORTC\n", count, ctrl,
+ 			    running ? ", running" : ", NOT running");
+ 			publishResource("IORTC", this);

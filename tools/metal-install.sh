@@ -87,6 +87,52 @@ else
 fi
 fi
 
+# optional: TZ_NAME=Europe/Warsaw sudo ./metal-install.sh ...  -> the system time zone. iOS keeps it as the link
+# /private/var/db/timezone/localtime (where /etc/localtime points) to a zoneinfo file; Settings -> Date & Time, which
+# normally changes it, hangs on this port. The link keeps the zoneinfo directory it already uses when that one has the
+# zone, else the first of /var/db/timezone/zoneinfo and /usr/share/zoneinfo that has it.
+if [[ -n ${TZ_NAME:-} ]]; then
+	echo "== time zone $TZ_NAME"
+	MNT=$mnt TZN=$TZ_NAME python3 - <<'PY'
+import os, sys
+root, name = os.environ['MNT'], os.environ['TZN']
+
+def inside(path, depth=0):
+    """path on the phone -> path here, following links the way the phone would"""
+    parts, cur = [p for p in path.split('/') if p], '/'
+    for i, part in enumerate(parts):
+        nxt = os.path.join(cur, part)
+        host = root + nxt
+        if os.path.islink(host) and depth < 40:
+            t = os.readlink(host)
+            t = t if t.startswith('/') else os.path.normpath(os.path.join(cur, t))
+            return inside(t + '/' + '/'.join(parts[i + 1:]), depth + 1)
+        cur = nxt
+    return root + cur
+
+lt = '/private/var/db/timezone/localtime'
+cur = os.readlink(root + lt) if os.path.islink(root + lt) else None
+print('now:', lt, '->', cur)
+dirs = []
+if cur and '/zoneinfo/' in cur:
+    dirs.append(cur.split('/zoneinfo/')[0] + '/zoneinfo')
+dirs += ['/var/db/timezone/zoneinfo', '/usr/share/zoneinfo']
+for d in dirs:
+    if os.path.isfile(inside(d + '/' + name)):
+        target = d + '/' + name
+        break
+else:
+    sys.exit(f'no zoneinfo file for {name} in {dirs}')
+os.makedirs(os.path.dirname(root + lt), exist_ok=True)
+if os.path.lexists(root + lt):
+    os.remove(root + lt)
+os.symlink(target, root + lt)
+print('set: ', lt, '->', target)
+etc = '/private/etc/localtime'
+print('     /etc/localtime ->', os.readlink(root + etc) if os.path.islink(root + etc) else '(not a link)')
+PY
+fi
+
 echo "== launchd job"
 M2V="$mnt/private/var/local/metal2/m2vtest" python3 - "$mnt/System/Library/xpc/launchd.plist" <<'PY'
 import os, plistlib, sys
