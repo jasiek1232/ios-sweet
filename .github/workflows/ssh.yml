@@ -107,6 +107,9 @@ jobs:
           chmod +x "$RUNNER_TEMP/ios-cc-tb"
           cd toybox
           make macos_defconfig
+          # readahead needs posix_fadvise(), which the macOS SDK has and the iOS SDK does not. Everything else
+          # in macos_defconfig compiles against iOS 16 headers (checked with theos/sdks iPhoneOS16.5).
+          sed -i 's/^CONFIG_READAHEAD=y/# CONFIG_READAHEAD is not set/' .config
           make -j"$(sysctl -n hw.ncpu)" HOSTCC=cc CC="$RUNNER_TEMP/ios-cc-tb" toybox
           file toybox
           cp toybox ../out/bin/toybox
