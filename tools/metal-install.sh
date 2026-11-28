@@ -133,6 +133,48 @@ print('     /etc/localtime ->', os.readlink(root + etc) if os.path.islink(root +
 PY
 fi
 
+# optional: SSH_PKG=ssh-userland.tar.gz [SSH_PUBKEY=~/.ssh/id_ed25519.pub] sudo -E ./metal-install.sh ...  -> SSH over the
+# USB Ethernet link (artifact of the workflow "ssh"): Dropbear, dash and toybox in /private/var/local/ssh, /bin/sh (stock iOS
+# has none; root's shell is /bin/sh), the key in /var/root/.ssh/authorized_keys and a launchd job org.sweet.dropbear on
+# port 22. Then from the PC: ssh root@192.168.7.2 (host keys are made on the first connection, which takes a few seconds).
+if [[ -n ${SSH_PKG:-} ]]; then
+	echo "== ssh"
+	sshd=$mnt/private/var/local/ssh
+	rm -rf "$sshd"
+	install -d -o 0 -g 0 -m 755 "$sshd" "$sshd/bin"
+	tar -xzf "$SSH_PKG" -C "$sshd" --no-same-owner
+	chown -R 0:0 "$sshd"
+	for p in dropbearkey scp dbclient; do ln -sf ../dropbearmulti "$sshd/bin/$p"; done
+	ln -sf dash "$sshd/bin/sh"
+	if [[ -x $sshd/bin/toybox && -f $sshd/toybox-commands.txt ]]; then
+		n=0
+		for c in $(cat "$sshd/toybox-commands.txt"); do
+			c=${c##*/}
+			[[ -n $c && $c != toybox && ! -e $sshd/bin/$c ]] || continue
+			ln -s toybox "$sshd/bin/$c"
+			n=$((n + 1))
+		done
+		echo "toybox: $n commands"
+	else
+		echo "toybox: not in the package (shell built-ins only)"
+	fi
+	if [[ -e $mnt/bin/sh || -L $mnt/bin/sh ]]; then
+		echo "/bin/sh already there: $(ls -l "$mnt/bin/sh" | cut -c1-120)"
+	else
+		install -d "$mnt/bin"
+		ln -s /private/var/local/ssh/bin/dash "$mnt/bin/sh"
+		echo "/bin/sh -> /private/var/local/ssh/bin/dash"
+	fi
+	if [[ -n ${SSH_PUBKEY:-} ]]; then
+		install -d -o 0 -g 0 -m 700 "$mnt/private/var/root/.ssh"
+		install -o 0 -g 0 -m 600 "$SSH_PUBKEY" "$mnt/private/var/root/.ssh/authorized_keys"
+		echo "authorized_keys: $(cut -c1-60 "$SSH_PUBKEY")..."
+	else
+		echo "no SSH_PUBKEY: only password login (root's password from the image's /etc/master.passwd)"
+	fi
+	ls -la "$sshd" | head -20
+fi
+
 echo "== launchd job"
 M2V="$mnt/private/var/local/metal2/m2vtest" python3 - "$mnt/System/Library/xpc/launchd.plist" <<'PY'
 import os, plistlib, sys
@@ -169,6 +211,17 @@ if os.path.exists(os.path.join(os.path.dirname(os.environ['M2V']), 'm2vtest')):
         'StandardErrorPath': '/dev/console',
     }
     print('org.sweet.m2vtest added')
+if os.path.exists(os.path.join(os.path.dirname(os.path.dirname(os.environ['M2V'])), 'ssh', 'dropbearmulti')):
+    plist['LaunchDaemons']['/System/Library/LaunchDaemons/org.sweet.dropbear.plist'] = {
+        'Label': 'org.sweet.dropbear',
+        'ProgramArguments': ['/private/var/local/ssh/dropbearmulti', 'dropbear', '-F', '-E', '-R', '-p', '22'],
+        'RunAtLoad': True,
+        'KeepAlive': True,
+        'UserName': 'root',
+        'StandardOutPath': '/dev/console',
+        'StandardErrorPath': '/dev/console',
+    }
+    print('org.sweet.dropbear added (ssh root@192.168.7.2)')
 with open(path, 'wb') as f:
     plistlib.dump(plist, f, fmt=plistlib.FMT_BINARY)
 os.chown(path, st.st_uid, st.st_gid)

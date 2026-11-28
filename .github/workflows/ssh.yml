@@ -1,0 +1,101 @@
+name: ssh
+
+# SSH for the phone, over the USB Ethernet link (kernel sweetusb=2: the phone is 192.168.7.2, the PC 192.168.7.1).
+# Builds for iOS 16 arm64, ad-hoc signed like vktest, all linked against libSystem only:
+#   dropbearmulti  Dropbear SSH server + dropbearkey + scp + dbclient (bundled libtom, no PAM, no zlib)
+#   dash           a POSIX shell (stock iOS has no /bin/sh; root's shell in /etc/passwd is /bin/sh)
+#   toybox         ls, cat, cp, mv, rm, mkdir, ps, top, grep, sed, find, ... (best effort: left out if it does not build)
+# Output: artifact "ssh-userland" (ssh-userland.tar.gz) for tools/metal-install.sh SSH_PKG=...
+
+on:
+  workflow_dispatch:
+    inputs:
+      runner:
+        description: "runner label: macos-15 (GitHub arm64), macos-15-intel, or self-hosted (your own Mac or macOS VM)"
+        default: macos-15
+
+concurrency:
+  group: ssh-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  DROPBEAR_TAG: DROPBEAR_2025.89
+  DASH_VERSION: 0.5.12
+  TOYBOX_TAG: 0.8.15
+  # where everything lives on the phone (the same tree metal-install.sh uses for vktest)
+  PREFIX: /private/var/local/ssh
+
+jobs:
+  build:
+    runs-on: ${{ inputs.runner || 'macos-15' }}
+    steps:
+      - name: Toolchain
+        run: |
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          CLANG=$(xcrun --sdk iphoneos -f clang)
+          # one word for configure scripts and toybox's make.sh: a wrapper that adds the iOS target
+          printf '#!/bin/sh\nexec "%s" -arch arm64 -isysroot "%s" -miphoneos-version-min=16.0 "$@"\n' "$CLANG" "$SDK" > "$RUNNER_TEMP/ios-cc"
+          chmod +x "$RUNNER_TEMP/ios-cc"
+          cat "$RUNNER_TEMP/ios-cc"
+          echo "IOS_CC=$RUNNER_TEMP/ios-cc" >> "$GITHUB_ENV"
+          mkdir -p out/bin
+
+      - name: Dropbear
+        run: |
+          git clone -q --depth 1 --branch "$DROPBEAR_TAG" https://github.com/mkj/dropbear dropbear
+          cd dropbear
+          cat > localoptions.h <<EOF
+          /* SWEET: host keys made on first connection (dropbear -R) next to the binaries; PATH has our tools first. */
+          #define DSS_PRIV_FILENAME "$PREFIX/dropbear_dss_host_key"
+          #define RSA_PRIV_FILENAME "$PREFIX/dropbear_rsa_host_key"
+          #define ECDSA_PRIV_FILENAME "$PREFIX/dropbear_ecdsa_host_key"
+          #define ED25519_PRIV_FILENAME "$PREFIX/dropbear_ed25519_host_key"
+          #define DEFAULT_PATH "$PREFIX/bin:/usr/bin:/bin"
+          #define DEFAULT_ROOT_PATH "$PREFIX/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+          #define DROPBEAR_SFTPSERVER 0
+          #define DROPBEAR_X11FWD 0
+          EOF
+          cat localoptions.h
+          ./configure --host=aarch64-apple-darwin --build="$(./config.guess 2>/dev/null || echo x86_64-apple-darwin)" \
+            CC="$IOS_CC" CFLAGS="-Os" \
+            --enable-bundled-libtom --disable-zlib --disable-pam \
+            --disable-lastlog --disable-utmp --disable-utmpx --disable-wtmp --disable-wtmpx \
+            --disable-loginfunc --disable-pututline --disable-pututxline
+          make -j"$(sysctl -n hw.ncpu)" PROGRAMS="dropbear dropbearkey scp dbclient" MULTI=1
+          file dropbearmulti
+          cp dropbearmulti ../out/
+
+      - name: dash
+        run: |
+          curl -fsSL -o dash.tgz "http://gondor.apana.org.au/~herbert/dash/files/dash-$DASH_VERSION.tar.gz"
+          tar xzf dash.tgz
+          cd "dash-$DASH_VERSION"
+          ./configure --host=aarch64-apple-darwin --build=x86_64-apple-darwin CC="$IOS_CC" CC_FOR_BUILD=cc CFLAGS="-Os"
+          make -j"$(sysctl -n hw.ncpu)"
+          file src/dash
+          cp src/dash ../out/bin/dash
+
+      - name: toybox (best effort)
+        continue-on-error: true
+        run: |
+          git clone -q --depth 1 --branch "$TOYBOX_TAG" https://github.com/landley/toybox toybox
+          cd toybox
+          make macos_defconfig
+          make -j"$(sysctl -n hw.ncpu)" HOSTCC=cc CC="$IOS_CC" toybox
+          file toybox
+          cp toybox ../out/bin/toybox
+          ./generated/instlist > ../out/toybox-commands.txt 2>/dev/null || \
+            (make HOSTCC=cc instlist >/dev/null && ./generated/instlist > ../out/toybox-commands.txt)
+          wc -w ../out/toybox-commands.txt
+
+      - name: Sign and package
+        run: |
+          cd out
+          for f in dropbearmulti bin/*; do codesign -f -s - "$f"; done
+          ls -la . bin
+          tar -czf ../ssh-userland.tar.gz .
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ssh-userland
+          path: ssh-userland.tar.gz
