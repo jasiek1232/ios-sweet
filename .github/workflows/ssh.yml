@@ -83,13 +83,30 @@ jobs:
         continue-on-error: true
         run: |
           git clone -q --depth 1 --branch "$TOYBOX_TAG" https://github.com/landley/toybox toybox
+          # toybox's build scripts need GNU sed (macOS sed fails with "invalid command code").
+          # Use gsed if the runner has it; otherwise build toybox's own bootstrap tools for this Mac
+          # (scripts/prereq: a host toybox with sed, made for exactly this) in a separate copy.
+          mkdir -p hostbin
+          if command -v gsed >/dev/null; then
+            ln -sf "$(command -v gsed)" hostbin/sed
+          else
+            cp -R toybox toybox-host
+            if (cd toybox-host && rm -rf generated && scripts/prereq/build.sh); then
+              ln -sf "$PWD/toybox-host/toybox-prereq" hostbin/sed
+            else
+              brew install gnu-sed && ln -sf "$(brew --prefix)/bin/gsed" hostbin/sed
+            fi
+          fi
+          export PATH="$PWD/hostbin:$PATH" SED="$PWD/hostbin/sed"
+          echo 's/x/GNU sed ok/' > t.sed && echo x | sed -f t.sed && sed --version 2>&1 | head -1 || true
           cd toybox
           make macos_defconfig
           make -j"$(sysctl -n hw.ncpu)" HOSTCC=cc CC="$IOS_CC" toybox
           file toybox
           cp toybox ../out/bin/toybox
-          ./generated/instlist > ../out/toybox-commands.txt 2>/dev/null || \
-            (make HOSTCC=cc instlist >/dev/null && ./generated/instlist > ../out/toybox-commands.txt)
+          # the command list, from a copy of toybox's instlist built for this Mac (not the phone)
+          cc -I . scripts/install.c -o ../instlist-host
+          ../instlist-host > ../out/toybox-commands.txt
           wc -w ../out/toybox-commands.txt
 
       - name: Sign and package
