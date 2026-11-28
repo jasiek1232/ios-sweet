@@ -54,6 +54,10 @@ jobs:
           #define DEFAULT_ROOT_PATH "$PREFIX/bin:/usr/sbin:/usr/bin:/sbin:/bin"
           #define DROPBEAR_SFTPSERVER 0
           #define DROPBEAR_X11FWD 0
+          /* Darwin has no setresgid(), so no privilege drop before auth; then unix-socket forwarding must go too
+             (TCP forwarding stays). We only log in as root anyway. */
+          #define DROPBEAR_SVR_DROP_PRIVS 0
+          #define DROPBEAR_SVR_LOCALSTREAMFWD 0
           EOF
           cat localoptions.h
           ./configure --host=aarch64-apple-darwin --build="$(./config.guess 2>/dev/null || echo x86_64-apple-darwin)" \
