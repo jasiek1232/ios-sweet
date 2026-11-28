@@ -56,123 +56,10 @@ if [[ -d $stage/SweetMetal2.bundle ]]; then
 	rm -rf "$mnt/System/Library/Extensions/SweetMetal2.bundle"
 	cp -a "$stage/SweetMetal2.bundle" "$mnt/System/Library/Extensions/"
 	chown -R 0:0 "$mnt/System/Library/Extensions/SweetMetal2.bundle"
-	# rm first: with M2V_DIAG it is a link to /dev/console, and install would follow it to the host's /dev/console
-	rm -f "$mnt/private/var/local/mtl2.log"
 	install -o 0 -g 0 -m 666 /dev/null "$mnt/private/var/local/mtl2.log"
 	printf 'SpringBoard\n' > "$mnt/private/var/local/mtl2-clients"
 	chown 0:0 "$mnt/private/var/local/mtl2-clients"; chmod 644 "$mnt/private/var/local/mtl2-clients"
 	install -d -o 0 -g 0 -m 777 "$mnt/private/var/local/m2v-cache"
-# optional: TU_DEBUG_OPTS=sysmem sudo ./metal-install.sh ...  -> Turnip options + log (/var/local/turnip-<proc>.log) in every Metal client
-if [[ -n ${TU_DEBUG_OPTS:-} ]]; then
-	printf '%s\n' "$TU_DEBUG_OPTS" > "$mnt/private/var/local/mtl2-tu-debug"; chmod 644 "$mnt/private/var/local/mtl2-tu-debug"
-else
-	rm -f "$mnt/private/var/local/mtl2-tu-debug"
-fi
-# optional: M2V_DIAG=1 sudo ./metal-install.sh ...  -> the bridge's own reports on the console (no rebuild): its degrade
-# notices (each copy, extra pass or stand-in it adds where Metal pays none, once per kind) and backboardd's telemetry every
-# 10 s (per command buffer: render passes, draws, pixels, dispatches and the blits Metal itself asked for). MTL2 lines
-# then show up twice on the console (once through the mtl2.log link).
-env_line='SWEET_M2V_MESSAGES=/dev/console'
-if [[ -n ${M2V_DIAG:-} ]]; then
-	rm -f "$mnt/private/var/local/mtl2.log"
-	ln -s /dev/console "$mnt/private/var/local/mtl2.log"
-	install -o 0 -g 0 -m 644 /dev/null "$mnt/private/var/local/mtl2-telemetry"
-	printf '%s\n' "$env_line" > "$mnt/private/var/local/mtl2-env"; chown 0:0 "$mnt/private/var/local/mtl2-env"; chmod 644 "$mnt/private/var/local/mtl2-env"
-else
-	rm -f "$mnt/private/var/local/mtl2-telemetry"
-	# only the file this option writes (one written by hand stays)
-	if [[ -f $mnt/private/var/local/mtl2-env && $(cat "$mnt/private/var/local/mtl2-env") == "$env_line" ]]; then
-		rm -f "$mnt/private/var/local/mtl2-env"
-	fi
-fi
-fi
-
-# optional: TZ_NAME=Europe/Warsaw sudo ./metal-install.sh ...  -> the system time zone. iOS keeps it as the link
-# /private/var/db/timezone/localtime (where /etc/localtime points) to a zoneinfo file; Settings -> Date & Time, which
-# normally changes it, hangs on this port. The link keeps the zoneinfo directory it already uses when that one has the
-# zone, else the first of /var/db/timezone/zoneinfo and /usr/share/zoneinfo that has it.
-if [[ -n ${TZ_NAME:-} ]]; then
-	echo "== time zone $TZ_NAME"
-	MNT=$mnt TZN=$TZ_NAME python3 - <<'PY'
-import os, sys
-root, name = os.environ['MNT'], os.environ['TZN']
-
-def inside(path, depth=0):
-    """path on the phone -> path here, following links the way the phone would"""
-    parts, cur = [p for p in path.split('/') if p], '/'
-    for i, part in enumerate(parts):
-        nxt = os.path.join(cur, part)
-        host = root + nxt
-        if os.path.islink(host) and depth < 40:
-            t = os.readlink(host)
-            t = t if t.startswith('/') else os.path.normpath(os.path.join(cur, t))
-            return inside(t + '/' + '/'.join(parts[i + 1:]), depth + 1)
-        cur = nxt
-    return root + cur
-
-lt = '/private/var/db/timezone/localtime'
-cur = os.readlink(root + lt) if os.path.islink(root + lt) else None
-print('now:', lt, '->', cur)
-dirs = []
-if cur and '/zoneinfo/' in cur:
-    dirs.append(cur.split('/zoneinfo/')[0] + '/zoneinfo')
-dirs += ['/var/db/timezone/zoneinfo', '/usr/share/zoneinfo']
-for d in dirs:
-    if os.path.isfile(inside(d + '/' + name)):
-        target = d + '/' + name
-        break
-else:
-    sys.exit(f'no zoneinfo file for {name} in {dirs}')
-os.makedirs(os.path.dirname(root + lt), exist_ok=True)
-if os.path.lexists(root + lt):
-    os.remove(root + lt)
-os.symlink(target, root + lt)
-print('set: ', lt, '->', target)
-etc = '/private/etc/localtime'
-print('     /etc/localtime ->', os.readlink(root + etc) if os.path.islink(root + etc) else '(not a link)')
-PY
-fi
-
-# optional: SSH_PKG=ssh-userland.tar.gz [SSH_PUBKEY=~/.ssh/id_ed25519.pub] sudo -E ./metal-install.sh ...  -> SSH over the
-# USB Ethernet link (artifact of the workflow "ssh"): Dropbear, dash and toybox in /private/var/local/ssh, /bin/sh (stock iOS
-# has none; root's shell is /bin/sh), the key in /var/root/.ssh/authorized_keys and a launchd job org.sweet.dropbear on
-# port 22. Then from the PC: ssh root@192.168.7.2 (host keys are made on the first connection, which takes a few seconds).
-if [[ -n ${SSH_PKG:-} ]]; then
-	echo "== ssh"
-	sshd=$mnt/private/var/local/ssh
-	rm -rf "$sshd"
-	install -d -o 0 -g 0 -m 755 "$sshd" "$sshd/bin"
-	tar -xzf "$SSH_PKG" -C "$sshd" --no-same-owner
-	chown -R 0:0 "$sshd"
-	for p in dropbearkey scp dbclient; do ln -sf ../dropbearmulti "$sshd/bin/$p"; done
-	ln -sf dash "$sshd/bin/sh"
-	if [[ -x $sshd/bin/toybox && -f $sshd/toybox-commands.txt ]]; then
-		n=0
-		for c in $(cat "$sshd/toybox-commands.txt"); do
-			c=${c##*/}
-			[[ -n $c && $c != toybox && ! -e $sshd/bin/$c ]] || continue
-			ln -s toybox "$sshd/bin/$c"
-			n=$((n + 1))
-		done
-		echo "toybox: $n commands"
-	else
-		echo "toybox: not in the package (shell built-ins only)"
-	fi
-	if [[ -e $mnt/bin/sh || -L $mnt/bin/sh ]]; then
-		echo "/bin/sh already there: $(ls -l "$mnt/bin/sh" | cut -c1-120)"
-	else
-		install -d "$mnt/bin"
-		ln -s /private/var/local/ssh/bin/dash "$mnt/bin/sh"
-		echo "/bin/sh -> /private/var/local/ssh/bin/dash"
-	fi
-	if [[ -n ${SSH_PUBKEY:-} ]]; then
-		install -d -o 0 -g 0 -m 700 "$mnt/private/var/root/.ssh"
-		install -o 0 -g 0 -m 600 "$SSH_PUBKEY" "$mnt/private/var/root/.ssh/authorized_keys"
-		echo "authorized_keys: $(cut -c1-60 "$SSH_PUBKEY")..."
-	else
-		echo "no SSH_PUBKEY: only password login (root's password from the image's /etc/master.passwd)"
-	fi
-	ls -la "$sshd" | head -20
 fi
 
 echo "== launchd job"
@@ -211,17 +98,6 @@ if os.path.exists(os.path.join(os.path.dirname(os.environ['M2V']), 'm2vtest')):
         'StandardErrorPath': '/dev/console',
     }
     print('org.sweet.m2vtest added')
-if os.path.exists(os.path.join(os.path.dirname(os.path.dirname(os.environ['M2V'])), 'ssh', 'dropbearmulti')):
-    plist['LaunchDaemons']['/System/Library/LaunchDaemons/org.sweet.dropbear.plist'] = {
-        'Label': 'org.sweet.dropbear',
-        'ProgramArguments': ['/private/var/local/ssh/dropbearmulti', 'dropbear', '-F', '-E', '-R', '-p', '22'],
-        'RunAtLoad': True,
-        'KeepAlive': True,
-        'UserName': 'root',
-        'StandardOutPath': '/dev/console',
-        'StandardErrorPath': '/dev/console',
-    }
-    print('org.sweet.dropbear added (ssh root@192.168.7.2)')
 with open(path, 'wb') as f:
     plistlib.dump(plist, f, fmt=plistlib.FMT_BINARY)
 os.chown(path, st.st_uid, st.st_gid)
