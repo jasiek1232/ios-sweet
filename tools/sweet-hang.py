@@ -4,8 +4,7 @@
 
   tools/sweet-hang.py CACHE REPORT.ips [REPORT.ips ...] [--all] [--proc NAME]
 
-CACHE is the dyld_shared_cache_arm64 of this iOS (in a writable directory: ipsw keeps a symbol
-cache next to it, CACHE.a2s). These reports are stackshots of every process; this prints the hung
+CACHE is the dyld_shared_cache_arm64 of this iOS (with its .01 ... .symbols files next to it). These reports are stackshots of every process; this prints the hung
 app's threads (or --proc NAME's), each blocked thread's wait ("mach_msg receive", "unfair lock owned
 by thread N", ...) and where its turnstile points (the thread / process it waits for), and the
 stack: shared-cache frames resolved with `ipsw dyld a2s` (the addresses in the report are unslid),
@@ -25,13 +24,15 @@ _memo = {}
 def a2s(cache, addr):
     if addr in _memo:
         return _memo[addr]
-    r = subprocess.run(['ipsw', 'dyld', 'a2s', '--cache', cache + '.a2s', cache, hex(addr)],
-                       capture_output=True, text=True)
+    # no --cache: that makes ipsw parse every symbol and all ObjC metadata of the whole cache (minutes,
+    # several GB of RAM); a direct lookup per address is quick
+    r = subprocess.run(['ipsw', 'dyld', 'a2s', cache, hex(addr)], capture_output=True, text=True)
     out = [l for l in r.stdout.splitlines() if l.startswith('0x')]
     sym = out[-1].split(': ', 1)[1] if out else '?'
     m = re.search(r'dylib=(\S+)', r.stderr + r.stdout)
     lib = os.path.basename(m.group(1).strip('"')) if m else ''
     _memo[addr] = f'{lib}: {sym}' if lib else sym
+    print(f'  {len(_memo)} addresses looked up', end='\r', file=sys.stderr, flush=True)
     return _memo[addr]
 
 
